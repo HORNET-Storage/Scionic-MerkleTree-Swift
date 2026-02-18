@@ -266,10 +266,66 @@ extension DagLeaf {
     /// Verifies the root leaf's hash by re-computing the CID.
     ///
     /// Mirrors Go's `VerifyRootLeaf`. Includes LeafCount, ContentSize, DagSize in the hash.
+    /// Also validates ContentSize and DagSize by recalculating from children (when full DAG available).
     public func verifyRootLeaf(dag: Dag) throws {
         let sortedAD = sortMapByKeys(additionalData)
         let sortedKV = sortMapForVerification(sortedAD)
 
+        if classicMerkleRoot.isEmpty {
+            classicMerkleRoot = Data()
+        }
+
+        // Validate ContentSize and DagSize if we have a full DAG with content
+        let isFullDag = dag.leafs.count == leafCount &&
+            (contentSize != 0 || dagSize != 0 || leafCount == 1) &&
+            !dag.leafs.values.contains(where: { $0.links.count < $0.currentLinkCount })
+
+        let hasContentMissing = isFullDag && dag.leafs.values.contains(where: {
+            $0.contentHash != nil && $0.content == nil
+        })
+
+        if isFullDag && !hasContentMissing {
+            // Calculate expected content size
+            var calculatedContentSize: Int64 = 0
+            for (_, dagLeaf) in dag.leafs {
+                if let content = dagLeaf.content {
+                    calculatedContentSize += Int64(content.count)
+                }
+            }
+
+            // Calculate expected dag size by serializing each child leaf
+            let cborEncoder = CBOREncoder()
+            var childrenDagSize: Int64 = 0
+            for (_, dagLeaf) in dag.leafs {
+                if dagLeaf.hash == hash { continue } // skip root
+                let childSerialized = cborEncoder.encodeMap(buildLeafSizeStruct(dagLeaf))
+                childrenDagSize += Int64(childSerialized.count)
+            }
+
+            // Serialize temp root with DagSize=0 to get root leaf size
+            let tempSerialized = cborEncoder.encodeMap([
+                ("ItemName", .textString(itemName)),
+                ("Type", .textString(type.rawValue)),
+                ("MerkleRoot", .byteString(classicMerkleRoot)),
+                ("CurrentLinkCount", .int(currentLinkCount)),
+                ("LeafCount", .int(leafCount)),
+                ("ContentSize", .int64(contentSize)),
+                ("DagSize", .int64(0)),
+                ("ContentHash", .optionalBytes(contentHash)),
+                ("AdditionalData", sortedKV != nil ? .array(sortedKV!.map { $0.toCBOR() }) : .null),
+            ])
+            let rootLeafSize = Int64(tempSerialized.count)
+            let calculatedDagSize = childrenDagSize + rootLeafSize
+
+            if contentSize != calculatedContentSize {
+                throw DagError.brokenDag("content size mismatch: stored \(contentSize), calculated \(calculatedContentSize)")
+            }
+            if dagSize != calculatedDagSize {
+                throw DagError.brokenDag("dag size mismatch: stored \(dagSize), calculated \(calculatedDagSize)")
+            }
+        }
+
+        // Verify CID hash
         let additionalDataCBOR: CBORValue
         if let kv = sortedKV {
             additionalDataCBOR = .array(kv.map { $0.toCBOR() })

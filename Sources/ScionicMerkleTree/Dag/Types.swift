@@ -220,8 +220,15 @@ public class DagBuilder {
             }
             // Rebuild classic merkle tree if parent has > 1 link
             if parent.links.count > 1 {
-                // This will be handled properly in TreeContent (Task #13)
-                // For now, just track that the tree needs rebuilding
+                let builder = TreeContent()
+                for link in parent.links {
+                    builder.addLeaf(key: link, data: link)
+                }
+                if let (merkleTree, leafMap) = try? builder.build() {
+                    parent.merkleTree = merkleTree
+                    parent.leafMap = leafMap
+                    parent.classicMerkleRoot = merkleTree.root
+                }
             }
         }
         leafs[leaf.hash] = leaf
