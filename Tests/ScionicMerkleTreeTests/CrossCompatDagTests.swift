@@ -55,5 +55,27 @@ final class CrossCompatDagTests: XCTestCase {
             XCTAssertEqual(leaf.itemName, expected.name, "Name mismatch for \(hash)")
             XCTAssertEqual(leaf.type, expected.type, "Type mismatch for \(hash)")
         }
+
+        // Verify the DAG
+        try dag.verify()
+
+        // Recreate directory and verify contents match
+        let outputDir = tmpDir + "/output"
+        try dag.createDirectory(path: outputDir)
+
+        let file1 = try String(contentsOfFile: outputDir + "/file1.txt", encoding: .utf8)
+        XCTAssertEqual(file1, "Hello from file one")
+
+        let file2 = try String(contentsOfFile: outputDir + "/file2.txt", encoding: .utf8)
+        XCTAssertEqual(file2, "Hello from file two")
+
+        let nested = try String(contentsOfFile: outputDir + "/subdir/nested.txt", encoding: .utf8)
+        XCTAssertEqual(nested, "I am nested")
+
+        // Test labels
+        try dag.calculateLabels()
+        XCTAssertEqual(dag.labels.count, 4) // 4 non-root leaves
+        let rootLabel = try dag.getLabel(hash: dag.root)
+        XCTAssertEqual(rootLabel, "0")
     }
 }
