@@ -1,8 +1,12 @@
-// Serialization.swift — JSON serialization/deserialization
+// Serialization.swift — JSON and CBOR serialization/deserialization
 //
 // Ported from dag/serialize.go.
-// Uses Swift Codable for JSON round-trips through SerializableDag intermediate.
+// Uses Swift Codable for JSON, CBOREncoder/CBORDecoder for CBOR.
 // FromSerializable rebuilds Classic Merkle Trees from links and reconstructs parent hashes.
+//
+// CBOR field names match Go's fxamacker/cbor defaults:
+//   - PascalCase for all fields (Hash, ItemName, Type, etc.)
+//   - Except StoredProofs which has cbor:"stored_proofs" tag
 
 import Foundation
 
@@ -172,4 +176,161 @@ extension Dag {
 
         return dag
     }
+}
+
+// MARK: - CBOR Serialization
+
+extension Dag {
+
+    /// Serializes the DAG to CBOR format.
+    ///
+    /// Mirrors Go's `ToCBOR()`. Uses PascalCase field names matching fxamacker/cbor defaults.
+    public func toCBOR() -> Data {
+        let cborEncoder = CBOREncoder()
+        let serializable = toSerializable()
+
+        var leafPairs: [(String, CBORValue)] = []
+        for (hash, sLeaf) in serializable.leafs {
+            leafPairs.append((hash, serializableDagLeafToCBOR(sLeaf)))
+        }
+
+        return cborEncoder.encodeMap([
+            ("Root", .textString(serializable.root)),
+            ("Leafs", .map(CBOROrderedMap(leafPairs))),
+        ])
+    }
+
+    /// Deserializes a DAG from CBOR format.
+    ///
+    /// Mirrors Go's `FromCBOR(data)`.
+    public static func fromCBOR(_ data: Data) throws -> Dag {
+        let decoder = CBORDecoder()
+        let value = try decoder.decode(data)
+
+        guard let map = value.mapValue else {
+            throw DagError.brokenDag("CBOR root is not a map")
+        }
+
+        let root = map["Root"]?.stringValue ?? ""
+
+        var sLeafs: [String: SerializableDagLeaf] = [:]
+        if let leafsMap = map["Leafs"]?.mapValue {
+            for pair in leafsMap.pairs {
+                sLeafs[pair.key] = cborToSerializableDagLeaf(pair.value)
+            }
+        }
+
+        return fromSerializable(SerializableDag(root: root, leafs: sLeafs))
+    }
+
+    /// Reads a DAG from a CBOR file on disk.
+    ///
+    /// Mirrors Go's `ReadDag(path)`.
+    public static func readDag(path: String) throws -> Dag {
+        let fileData = try Data(contentsOf: URL(fileURLWithPath: path))
+        return try fromCBOR(fileData)
+    }
+}
+
+// MARK: - CBOR Encoding Helpers
+
+func serializableDagLeafToCBOR(_ sLeaf: SerializableDagLeaf) -> CBORValue {
+    var pairs: [(String, CBORValue)] = [
+        ("Hash", .textString(sLeaf.hash)),
+        ("ItemName", .textString(sLeaf.itemName)),
+        ("Type", .textString(sLeaf.type)),
+        ("ContentHash", .optionalBytes(sLeaf.contentHash)),
+        ("Content", .optionalBytes(sLeaf.content)),
+        ("ClassicMerkleRoot", .optionalBytes(sLeaf.classicMerkleRoot)),
+        ("CurrentLinkCount", .int(sLeaf.currentLinkCount)),
+        ("LeafCount", .int(sLeaf.leafCount)),
+        ("ContentSize", .int64(sLeaf.contentSize)),
+        ("DagSize", .int64(sLeaf.dagSize)),
+        ("Links", sLeaf.links.isEmpty ? .null : .array(sLeaf.links.map { .textString($0) })),
+        ("AdditionalData", encodeSortedMapToCBOR(sLeaf.additionalData)),
+    ]
+
+    if let sp = sLeaf.storedProofs, !sp.isEmpty {
+        var proofPairs: [(String, CBORValue)] = []
+        for (k, v) in sp {
+            proofPairs.append((k, serializableProofToCBOR(v)))
+        }
+        pairs.append(("stored_proofs", .map(CBOROrderedMap(proofPairs))))
+    }
+
+    return .map(CBOROrderedMap(pairs))
+}
+
+func serializableProofToCBOR(_ sp: SerializableProof) -> CBORValue {
+    return .map(CBOROrderedMap([
+        ("Leaf", .textString(sp.leaf)),
+        ("Proof", .map(CBOROrderedMap([
+            ("Siblings", .array(sp.siblings.map { .byteString($0) })),
+            ("Path", .unsignedInt(UInt64(sp.path))),
+        ]))),
+    ]))
+}
+
+func encodeSortedMapToCBOR(_ m: [String: String]) -> CBORValue {
+    if m.isEmpty {
+        return .map(CBOROrderedMap([]))
+    }
+    let sorted = m.sorted { $0.key < $1.key }
+    return .map(CBOROrderedMap(sorted.map { ($0.key, CBORValue.textString($0.value)) }))
+}
+
+// MARK: - CBOR Decoding Helpers
+
+func cborToSerializableDagLeaf(_ value: CBORValue) -> SerializableDagLeaf {
+    guard let map = value.mapValue else { return SerializableDagLeaf() }
+
+    var sLeaf = SerializableDagLeaf()
+    sLeaf.hash = map["Hash"]?.stringValue ?? ""
+    sLeaf.itemName = map["ItemName"]?.stringValue ?? ""
+    sLeaf.type = map["Type"]?.stringValue ?? "file"
+    sLeaf.contentHash = map["ContentHash"]?.dataValue
+    sLeaf.content = map["Content"]?.dataValue
+    sLeaf.classicMerkleRoot = map["ClassicMerkleRoot"]?.dataValue
+    sLeaf.currentLinkCount = map["CurrentLinkCount"]?.intValue ?? 0
+    sLeaf.leafCount = map["LeafCount"]?.intValue ?? 0
+    sLeaf.contentSize = map["ContentSize"]?.int64Value ?? 0
+    sLeaf.dagSize = map["DagSize"]?.int64Value ?? 0
+
+    if let linksArray = map["Links"]?.arrayValue {
+        sLeaf.links = linksArray.compactMap { $0.stringValue }
+    }
+
+    if let adMap = map["AdditionalData"]?.mapValue {
+        for pair in adMap.pairs {
+            if let val = pair.value.stringValue {
+                sLeaf.additionalData[pair.key] = val
+            }
+        }
+    }
+
+    if let proofsMap = map["stored_proofs"]?.mapValue {
+        var sp: [String: SerializableProof] = [:]
+        for pair in proofsMap.pairs {
+            sp[pair.key] = cborToSerializableProof(pair.value)
+        }
+        sLeaf.storedProofs = sp
+    }
+
+    return sLeaf
+}
+
+func cborToSerializableProof(_ value: CBORValue) -> SerializableProof {
+    guard let map = value.mapValue else { return SerializableProof() }
+
+    var sp = SerializableProof()
+    sp.leaf = map["Leaf"]?.stringValue ?? ""
+
+    if let proofMap = map["Proof"]?.mapValue {
+        if let siblingsArray = proofMap["Siblings"]?.arrayValue {
+            sp.siblings = siblingsArray.compactMap { $0.dataValue }
+        }
+        sp.path = UInt32(proofMap["Path"]?.uintValue ?? 0)
+    }
+
+    return sp
 }

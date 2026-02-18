@@ -58,7 +58,9 @@ public func createDagWithConfig(path: String, config: DagBuilderConfig?) throws 
         additionalData = ["timestamp": timeString]
     }
 
-    // Parallel mode not yet implemented — use sequential
+    if cfg.enableParallel {
+        return try createDagParallel(path: path, additionalData: additionalData, processor: cfg.processor, config: cfg)
+    }
     return try createDagInternal(path: path, additionalData: additionalData, processor: cfg.processor)
 }
 
@@ -290,6 +292,183 @@ private func relativePath(from base: String, to target: String) -> String {
         return "."
     }
     return relativeParts.joined(separator: "/")
+}
+
+// MARK: - Parallel DAG Creation
+
+private func createDagParallel(path: String, additionalData: [String: String]?, processor: LeafProcessor?, config: DagBuilderConfig) throws -> Dag {
+    let dag = DagBuilder()
+    let fm = FileManager.default
+
+    var isDir: ObjCBool = false
+    guard fm.fileExists(atPath: path, isDirectory: &isDir) else {
+        throw DagCreationError.pathNotFound(path)
+    }
+
+    let parentPath = (path as NSString).deletingLastPathComponent
+
+    var leaf: DagLeaf
+    if isDir.boolValue {
+        leaf = try processDirectoryParallel(
+            fullPath: path, parentPath: parentPath, dag: dag,
+            isRoot: true, additionalData: additionalData, processor: processor, config: config
+        )
+    } else {
+        // Single file — no parallelism benefit, use sequential
+        leaf = try processFile(
+            fullPath: path, parentPath: parentPath, dag: dag,
+            isRoot: true, additionalData: additionalData, processor: processor
+        )
+    }
+
+    let rootBuilder = DagLeafBuilder(name: leaf.itemName)
+    rootBuilder.setType(leaf.type)
+    for linkHash in leaf.links {
+        rootBuilder.addLink(linkHash)
+    }
+    if let content = leaf.content {
+        rootBuilder.setData(content)
+    }
+
+    let rootLeaf = try rootBuilder.buildRootLeaf(dag: dag, additionalData: additionalData)
+    dag.leafs[rootLeaf.hash] = rootLeaf
+
+    return dag.buildDag(root: rootLeaf.hash)
+}
+
+private struct ParallelEntryResult {
+    let leaf: DagLeaf
+    let index: Int
+}
+
+private func processDirectoryParallel(
+    fullPath: String, parentPath: String, dag: DagBuilder,
+    isRoot: Bool, additionalData: [String: String]?, processor: LeafProcessor?,
+    config: DagBuilderConfig
+) throws -> DagLeaf {
+    let relPath = relativePath(from: parentPath, to: fullPath)
+
+    var localAdditionalData = additionalData
+    if let processor = processor, !isRoot {
+        let customData = processor(fullPath, relPath, true, isRoot, .directory)
+        if let customData = customData {
+            if localAdditionalData == nil { localAdditionalData = [:] }
+            for (k, v) in customData { localAdditionalData![k] = v }
+        }
+    }
+
+    let builder = DagLeafBuilder(name: relPath)
+    builder.setType(.directory)
+
+    let fm = FileManager.default
+    let entries = try fm.contentsOfDirectory(atPath: fullPath).sorted()
+
+    // Determine worker count
+    var maxWorkers = config.maxWorkers
+    if maxWorkers == 0 {
+        maxWorkers = ProcessInfo.processInfo.processorCount
+    } else if maxWorkers < 0 {
+        maxWorkers = entries.count
+    }
+    maxWorkers = min(maxWorkers, entries.count)
+
+    // If 0 or 1 entries, process sequentially
+    if entries.count <= 1 {
+        for childName in entries {
+            let childFullPath = (fullPath as NSString).appendingPathComponent(childName)
+            var childIsDir: ObjCBool = false
+            guard fm.fileExists(atPath: childFullPath, isDirectory: &childIsDir) else { continue }
+
+            let childLeaf: DagLeaf
+            if childIsDir.boolValue {
+                childLeaf = try processDirectoryParallel(
+                    fullPath: childFullPath, parentPath: fullPath, dag: dag,
+                    isRoot: false, additionalData: nil, processor: processor, config: config
+                )
+            } else {
+                childLeaf = try processFile(
+                    fullPath: childFullPath, parentPath: fullPath, dag: dag,
+                    isRoot: false, additionalData: nil, processor: processor
+                )
+            }
+            builder.addLink(childLeaf.hash)
+            dag.addLeafSafe(childLeaf, parent: nil)
+        }
+        return try builder.buildLeaf(additionalData: localAdditionalData)
+    }
+
+    // Process entries in parallel using DispatchQueue
+    let group = DispatchGroup()
+    let resultsLock = NSLock()
+    var results: [ParallelEntryResult] = []
+    var firstError: Error? = nil
+    let semaphore = DispatchSemaphore(value: maxWorkers)
+
+    for (i, childName) in entries.enumerated() {
+        let childFullPath = (fullPath as NSString).appendingPathComponent(childName)
+
+        var childIsDir: ObjCBool = false
+        guard fm.fileExists(atPath: childFullPath, isDirectory: &childIsDir) else { continue }
+
+        let isChildDir = childIsDir.boolValue
+        let index = i
+
+        group.enter()
+        semaphore.wait()
+
+        DispatchQueue.global().async {
+            defer {
+                semaphore.signal()
+                group.leave()
+            }
+
+            // Check if we already have an error
+            resultsLock.lock()
+            let hasError = firstError != nil
+            resultsLock.unlock()
+            if hasError { return }
+
+            do {
+                let childLeaf: DagLeaf
+                if isChildDir {
+                    childLeaf = try processDirectoryParallel(
+                        fullPath: childFullPath, parentPath: fullPath, dag: dag,
+                        isRoot: false, additionalData: nil, processor: processor, config: config
+                    )
+                } else {
+                    childLeaf = try processFile(
+                        fullPath: childFullPath, parentPath: fullPath, dag: dag,
+                        isRoot: false, additionalData: nil, processor: processor
+                    )
+                }
+
+                dag.addLeafSafe(childLeaf, parent: nil)
+
+                resultsLock.lock()
+                results.append(ParallelEntryResult(leaf: childLeaf, index: index))
+                resultsLock.unlock()
+            } catch {
+                resultsLock.lock()
+                if firstError == nil { firstError = error }
+                resultsLock.unlock()
+            }
+        }
+    }
+
+    group.wait()
+
+    if let error = firstError {
+        throw error
+    }
+
+    // Sort results by original index to maintain determinism
+    results.sort { $0.index < $1.index }
+
+    for result in results {
+        builder.addLink(result.leaf.hash)
+    }
+
+    return try builder.buildLeaf(additionalData: localAdditionalData)
 }
 
 // MARK: - Errors
