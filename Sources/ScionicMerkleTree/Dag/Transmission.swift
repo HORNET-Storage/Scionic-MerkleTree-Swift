@@ -167,3 +167,209 @@ extension Dag {
         }
     }
 }
+
+// MARK: - Batched Transmission
+
+extension Dag {
+
+    /// Groups leaves into size-limited batches for efficient transmission.
+    ///
+    /// Mirrors Go's `GetBatchedLeafSequence`. Maintains BFS order.
+    /// If batchSize <= 0, each leaf becomes its own batch.
+    public func getBatchedLeafSequence() -> [BatchedTransmissionPacket] {
+        // If batching disabled, wrap each individual packet
+        if batchSize <= 0 {
+            let packets = getLeafSequence()
+            return packets.enumerated().map { (i, packet) in
+                BatchedTransmissionPacket(
+                    leaves: [packet.leaf],
+                    relationships: [packet.leaf.hash: packet.parentHash],
+                    packetIndex: i,
+                    totalPackets: packets.count
+                )
+            }
+        }
+
+        var batches: [BatchedTransmissionPacket] = []
+        var visited = Set<String>()
+
+        guard let rootLeaf = leafs[root] else { return batches }
+
+        // Start first batch with root
+        var currentBatch = BatchedTransmissionPacket()
+        var currentBatchSize = 0
+
+        let rootClone = rootLeaf.clone()
+        currentBatch.leaves.append(rootClone)
+        currentBatch.relationships[rootClone.hash] = ""
+        currentBatchSize += rootClone.estimateSize()
+        visited.insert(root)
+
+        var parentsInBatch = Set<String>([root])
+
+        // BFS traversal
+        var queue = [root]
+        while !queue.isEmpty {
+            let current = queue.removeFirst()
+            guard let currentLeaf = leafs[current] else { continue }
+
+            let sortedLinks = currentLeaf.links.sorted()
+
+            for childHash in sortedLinks {
+                if visited.contains(childHash) { continue }
+                guard let childLeaf = leafs[childHash] else { continue }
+
+                let childClone = childLeaf.clone()
+                let childSize = childClone.estimateSize()
+
+                // Check if adding would exceed batch size
+                if currentBatchSize + childSize > batchSize && !currentBatch.leaves.isEmpty {
+                    // Finalize and start new batch
+                    finalizeBatch(&currentBatch, parentsInBatch: parentsInBatch)
+                    batches.append(currentBatch)
+
+                    currentBatch = BatchedTransmissionPacket()
+                    currentBatchSize = 0
+                    parentsInBatch = Set<String>()
+                }
+
+                currentBatch.leaves.append(childClone)
+                currentBatch.relationships[childClone.hash] = current
+                currentBatchSize += childSize
+                visited.insert(childHash)
+                parentsInBatch.insert(childHash)
+                queue.append(childHash)
+            }
+        }
+
+        // Finalize last batch
+        if !currentBatch.leaves.isEmpty {
+            finalizeBatch(&currentBatch, parentsInBatch: parentsInBatch)
+            batches.append(currentBatch)
+        }
+
+        // Set indices
+        for i in 0..<batches.count {
+            batches[i].packetIndex = i
+            batches[i].totalPackets = batches.count
+        }
+
+        return batches
+    }
+
+    /// Generates Merkle proofs for parent leaves in a batch.
+    private func finalizeBatch(_ batch: inout BatchedTransmissionPacket, parentsInBatch: Set<String>) {
+        for parentHash in parentsInBatch {
+            guard let parentLeaf = batch.leaves.first(where: { $0.hash == parentHash }) else { continue }
+            guard parentLeaf.currentLinkCount > 1 else { continue }
+
+            // Build merkle tree from parent's links
+            let builder = TreeContent()
+            var sortedLinks = parentLeaf.links
+            sortedLinks.sort()
+            for link in sortedLinks {
+                builder.addLeaf(key: link, data: link)
+            }
+
+            guard let (merkleTree, _) = try? builder.build() else { continue }
+
+            // Generate proofs for all children
+            if parentLeaf.proofs.isEmpty {
+                parentLeaf.proofs = [:]
+            }
+            for linkHash in sortedLinks {
+                let (index, exists) = merkleTree.getIndexForKey(linkHash)
+                if exists && index < merkleTree.proofs.count {
+                    parentLeaf.proofs[linkHash] = ClassicTreeBranch(
+                        leaf: linkHash,
+                        proof: merkleTree.proofs[index]
+                    )
+                }
+            }
+        }
+    }
+
+    /// Verifies a batched transmission packet.
+    public func verifyBatchedTransmissionPacket(_ packet: BatchedTransmissionPacket) throws {
+        var batchLeaves: [String: DagLeaf] = [:]
+        for leaf in packet.leaves {
+            batchLeaves[leaf.hash] = leaf
+        }
+
+        for childLeaf in packet.leaves {
+            guard let parentHash = packet.relationships[childLeaf.hash] else {
+                throw DagError.brokenDag("missing relationship for leaf \(childLeaf.hash)")
+            }
+
+            if parentHash.isEmpty {
+                // Root leaf
+                let tempDag = Dag(root: childLeaf.hash, leafs: [childLeaf.hash: childLeaf])
+                try childLeaf.verifyRootLeaf(dag: tempDag)
+            } else {
+                try childLeaf.verifyLeaf()
+
+                // Find parent (in batch or in existing DAG)
+                let parentLeaf = batchLeaves[parentHash] ?? leafs[parentHash]
+                if let parentLeaf = parentLeaf, parentLeaf.currentLinkCount > 1 {
+                    if parentLeaf.proofs.isEmpty { continue }
+                    guard let proof = parentLeaf.proofs[childLeaf.hash] else {
+                        if batchLeaves[parentHash] != nil { continue }
+                        throw DagError.brokenDag("missing proof for \(childLeaf.hash)")
+                    }
+                    try parentLeaf.verifyBranch(proof)
+                }
+            }
+        }
+    }
+
+    /// Applies a batched transmission packet to this DAG.
+    public func applyBatchedTransmissionPacket(_ packet: BatchedTransmissionPacket) {
+        var parentsToUpdate = Set<String>()
+
+        for leaf in packet.leaves {
+            if let existing = leafs[leaf.hash] {
+                // Merge proofs from incoming leaf
+                for (k, v) in leaf.proofs {
+                    existing.proofs[k] = v
+                }
+                // Merge links
+                for link in leaf.links {
+                    if !existing.hasLink(link) {
+                        existing.addLink(link)
+                    }
+                }
+            } else {
+                leafs[leaf.hash] = leaf
+            }
+
+            if let parentHash = packet.relationships[leaf.hash], !parentHash.isEmpty {
+                if let parent = leafs[parentHash] {
+                    if !parent.hasLink(leaf.hash) {
+                        parent.addLink(leaf.hash)
+                        parentsToUpdate.insert(parentHash)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Verifies then applies a batched transmission packet.
+    public func applyAndVerifyBatchedTransmissionPacket(_ packet: BatchedTransmissionPacket) throws {
+        try verifyBatchedTransmissionPacket(packet)
+        applyBatchedTransmissionPacket(packet)
+    }
+}
+
+// MARK: - BatchedTransmissionPacket Helpers
+
+extension BatchedTransmissionPacket {
+    /// Returns the root leaf from this batch (the one with empty parent).
+    public func getRootLeaf() -> DagLeaf? {
+        for leaf in leaves {
+            if let parentHash = relationships[leaf.hash], parentHash.isEmpty {
+                return leaf
+            }
+        }
+        return leaves.first
+    }
+}

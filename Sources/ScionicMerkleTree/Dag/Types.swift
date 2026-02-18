@@ -162,6 +162,38 @@ public class DagLeaf {
         // merkleTree and leafMap are transient, not cloned
         c.proofs = proofs
         return c
+        return c
+    }
+
+    /// Returns approximate serialized size without full CBOR encoding.
+    ///
+    /// Mirrors Go's `EstimateSize()`. Used by batched transmission to decide batch boundaries.
+    public func estimateSize() -> Int {
+        var size = 0
+        size += hash.utf8.count                          // Hash (~64 bytes)
+        size += itemName.utf8.count                      // ItemName
+        size += type.rawValue.utf8.count                 // Type (~10 bytes)
+        size += content?.count ?? 0                      // Content
+        size += contentHash?.count ?? 0                  // ContentHash (32 if present)
+        size += classicMerkleRoot.count                  // ClassicMerkleRoot (32 if present)
+        size += links.count * 64                         // Links (each ~64 byte CID)
+        for (key, value) in additionalData {
+            size += key.utf8.count + value.utf8.count     // AdditionalData
+        }
+        for (_, proof) in proofs {
+            size += 10 * 32                               // ~10 siblings per proof, 32 bytes each
+            _ = proof // suppress unused warning
+        }
+        size += 32                                        // Integer fields overhead
+        size += 100                                       // Struct + CBOR encoding overhead
+        return size
+    }
+
+    /// Sets a label on this leaf (used by label management).
+    public func setLabel(_ label: String) {
+        // Labels are managed at the Dag level, but this provides API compat with Go
+        // In Go, this modifies the hash to include the label, but in practice
+        // labels are stored in Dag.labels, not on the leaf itself
     }
 }
 
