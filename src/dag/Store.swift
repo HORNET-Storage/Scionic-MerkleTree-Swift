@@ -47,16 +47,31 @@ public protocol LeafEnumerator {
     func getAllLeafHashes() -> [String]
 }
 
+/// Optional interface for stores that cache childHash -> parentHash relationships.
+public protocol RelationshipCache {
+    func getCachedRelationships() -> [String: String]?
+}
+
 // MARK: - DagIndex
 
 /// Lightweight metadata for efficient DAG traversal without loading leaves.
 public struct DagIndex {
     /// All leaf hashes in traversal order.
-    public var leafHashes: [String] = []
-    /// childHash -> [parentHash, ...] for each child.
-    public var children: [String: [String]] = [:]
+    public var leafHashes: [String]
+    /// parentHash -> child hashes.
+    public var children: [String: [String]]
     /// childHash -> parentHash reverse mapping.
-    public var parents: [String: String] = [:]
+    public var parents: [String: String]
+
+    public init(
+        leafHashes: [String] = [],
+        children: [String: [String]] = [:],
+        parents: [String: String] = [:]
+    ) {
+        self.leafHashes = leafHashes
+        self.children = children
+        self.parents = parents
+    }
 }
 
 // MARK: - DagStore
@@ -171,6 +186,148 @@ public class DagStore {
         }
     }
 
+    public func setRoot(_ rootHash: String) throws {
+        lock.lock()
+        root = rootHash
+        lock.unlock()
+
+        if let rootLeaf = try retrieveLeafWithoutContent(rootHash) {
+            lock.lock()
+            leafCount = rootLeaf.leafCount
+            lock.unlock()
+        }
+    }
+
+    /// Builds an in-memory traversal index using cached relationships when available.
+    public func buildIndex() throws {
+        guard !root.isEmpty else {
+            throw DagError.brokenDag("no root set")
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let cache = leafStore as? RelationshipCache,
+           let relationships = cache.getCachedRelationships() {
+            try buildIndexFromCache(relationships)
+            return
+        }
+
+        try buildIndexByTraversal()
+    }
+
+    private func buildIndexFromCache(_ relationships: [String: String]) throws {
+        var newIndex = DagIndex()
+
+        for (childHash, parentHash) in relationships {
+            newIndex.parents[childHash] = parentHash
+            if !parentHash.isEmpty {
+                newIndex.children[parentHash, default: []].append(childHash)
+            }
+        }
+
+        var visited = Set<String>()
+        var queue = [root]
+        var cursor = 0
+
+        while cursor < queue.count {
+            let current = queue[cursor]
+            cursor += 1
+
+            if visited.contains(current) { continue }
+            visited.insert(current)
+            newIndex.leafHashes.append(current)
+
+            var children = newIndex.children[current] ?? []
+            children.sort()
+            newIndex.children[current] = children
+            for childHash in children where !visited.contains(childHash) {
+                queue.append(childHash)
+            }
+        }
+
+        if let rootLeaf = try leafStore.retrieveLeafWithoutContent(root) {
+            leafCount = rootLeaf.leafCount
+        }
+
+        index = newIndex
+        indexBuilt = true
+    }
+
+    private func buildIndexByTraversal() throws {
+        var newIndex = DagIndex()
+        var visited = Set<String>()
+        var queue: [(hash: String, parentHash: String)] = [(root, "")]
+        var cursor = 0
+
+        while cursor < queue.count {
+            let current = queue[cursor]
+            cursor += 1
+
+            if visited.contains(current.hash) { continue }
+            visited.insert(current.hash)
+
+            guard let leaf = try leafStore.retrieveLeafWithoutContent(current.hash) else {
+                continue
+            }
+
+            newIndex.leafHashes.append(current.hash)
+            newIndex.parents[current.hash] = current.parentHash
+
+            if !leaf.links.isEmpty {
+                let children = leaf.links
+                newIndex.children[current.hash] = children
+                for childHash in children where !visited.contains(childHash) {
+                    queue.append((childHash, current.hash))
+                }
+            }
+
+            if current.hash == root {
+                leafCount = leaf.leafCount
+            }
+        }
+
+        index = newIndex
+        indexBuilt = true
+    }
+
+    public func hasIndex() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return indexBuilt
+    }
+
+    public func getIndex() -> DagIndex? {
+        lock.lock(); defer { lock.unlock() }
+        return index
+    }
+
+    public func clearIndex() {
+        lock.lock(); defer { lock.unlock() }
+        index = nil
+        indexBuilt = false
+    }
+
+    public func addToIndex(leafHash: String, parentHash: String, children: [String]) {
+        lock.lock(); defer { lock.unlock() }
+
+        if index == nil {
+            index = DagIndex()
+        }
+
+        guard index?.leafHashes.contains(leafHash) == false else { return }
+
+        index?.leafHashes.append(leafHash)
+        index?.parents[leafHash] = parentHash
+        if !children.isEmpty {
+            index?.children[leafHash] = children
+        }
+    }
+
+    public func markIndexBuilt() {
+        lock.lock(); defer { lock.unlock() }
+        indexBuilt = true
+    }
+
     // MARK: - DAG Conversion
 
     /// Reconstructs a full in-memory Dag from the store.
@@ -226,8 +383,7 @@ public class DagStore {
         guard let rootLeaf = try retrieveLeafWithoutContent(root) else {
             throw DagError.childMissing(root)
         }
-        let d = try toDag()
-        try rootLeaf.verifyRootLeaf(dag: d)
+        try rootLeaf.verifyRootLeaf()
         if rootLeaf.links.count == rootLeaf.currentLinkCount && rootLeaf.currentLinkCount > 0 {
             try verifyChildrenAgainstMerkleRootStreaming(rootLeaf)
         }
@@ -258,8 +414,7 @@ public class DagStore {
         guard let rootLeaf = try retrieveLeafWithoutContent(root) else {
             throw DagError.childMissing(root)
         }
-        let d = try toDag()
-        try rootLeaf.verifyRootLeaf(dag: d)
+        try rootLeaf.verifyRootLeaf()
 
         if rootLeaf.currentLinkCount > 0 {
             var childrenInDag = 0
@@ -388,8 +543,7 @@ public class DagStore {
             throw DagError.childMissing(hash)
         }
         if hash == root {
-            let d = try toDag()
-            try leaf.verifyRootLeaf(dag: d)
+            try leaf.verifyRootLeaf()
         } else {
             try leaf.verifyLeaf()
         }
@@ -408,8 +562,7 @@ public class DagStore {
         }
 
         if leafHash == root {
-            let d = try toDag()
-            try leaf.verifyRootLeaf(dag: d)
+            try leaf.verifyRootLeaf()
         } else {
             try leaf.verifyLeaf()
         }
@@ -564,32 +717,41 @@ public class DagStore {
 
     /// Adds a transmission packet to the store.
     public func addTransmissionPacket(_ packet: TransmissionPacket) throws {
-        // Set root from first packet (root has empty parentHash)
         if packet.parentHash.isEmpty {
+            try packet.leaf.verifyRootLeaf()
+            packet.leaf.parentHash = ""
+            try storeLeaf(packet.leaf)
+
+            lock.lock()
             root = packet.leaf.hash
             leafCount = packet.leaf.leafCount
+            lock.unlock()
+            return
         }
 
+        try packet.leaf.verifyLeaf()
+
+        if let parent = try retrieveLeafWithoutContent(packet.parentHash) {
+            guard parent.hasLink(packet.leaf.hash) else {
+                throw DagError.brokenDag("parent \(packet.parentHash) does not link to child \(packet.leaf.hash)")
+            }
+
+            if parent.currentLinkCount > 1 {
+                guard let proof = packet.proofs[packet.leaf.hash] else {
+                    throw DagError.brokenDag("missing merkle proof for leaf \(packet.leaf.hash)")
+                }
+                try parent.verifyBranch(proof)
+            }
+        }
+
+        packet.leaf.parentHash = packet.parentHash
         try storeLeaf(packet.leaf)
 
-        // Establish parent-child link
-        if !packet.parentHash.isEmpty {
-            if let parent = try leafStore.retrieveLeaf(packet.parentHash) {
-                if !parent.hasLink(packet.leaf.hash) {
-                    parent.addLink(packet.leaf.hash)
-                    try leafStore.storeLeaf(parent)
-                }
-            }
-        }
-
-        // Store proofs
-        for (leafHash, proof) in packet.proofs {
-            // Find the parent that has this child link
-            // For now, store proofs on the leaf's parent
-            if let parent = try leafStore.retrieveLeaf(packet.parentHash) {
+        if !packet.proofs.isEmpty, let parent = try leafStore.retrieveLeaf(packet.parentHash) {
+            for (leafHash, proof) in packet.proofs {
                 parent.proofs[leafHash] = proof
-                try leafStore.storeLeaf(parent)
             }
+            try leafStore.storeLeaf(parent)
         }
     }
 
@@ -601,12 +763,13 @@ public class DagStore {
         for leaf in packet.leaves {
             let parentHash = packet.relationships[leaf.hash] ?? ""
             if parentHash.isEmpty && root.isEmpty {
-                let tempDag = Dag(root: leaf.hash, leafs: [leaf.hash: leaf])
-                try leaf.verifyRootLeaf(dag: tempDag)
+                try leaf.verifyRootLeaf()
+                leaf.parentHash = ""
                 root = leaf.hash
                 leafCount = leaf.leafCount
             } else if !parentHash.isEmpty {
                 try leaf.verifyLeaf()
+                leaf.parentHash = parentHash
                 if let parent = try retrieveLeafWithoutContent(parentHash), !parent.hasLink(leaf.hash) {
                     throw DagError.brokenDag("parent \(parentHash) does not link to child \(leaf.hash)")
                 }
@@ -650,14 +813,35 @@ public class DagStore {
         try visit(root, parent: nil)
     }
 
+    public func iterateDagWithIndex(_ processLeaf: (String, String) throws -> Void) throws {
+        guard !root.isEmpty else {
+            throw DagError.brokenDag("no root set")
+        }
+
+        if !hasIndex() || getIndex() == nil {
+            try buildIndex()
+        }
+
+        guard let currentIndex = getIndex() else {
+            throw DagError.brokenDag("index not built")
+        }
+
+        for leafHash in currentIndex.leafHashes {
+            try processLeaf(leafHash, currentIndex.parents[leafHash] ?? "")
+        }
+    }
+
     public func countLeavesStreaming() throws -> Int {
         if root.isEmpty { return 0 }
-        if let counter = leafStore as? LeafCounter {
-            return counter.count()
+        if let currentIndex = getIndex(), hasIndex(), !currentIndex.leafHashes.isEmpty {
+            return currentIndex.leafHashes.count
         }
         if leafCount > 0 { return leafCount }
         if let rootLeaf = try retrieveLeafWithoutContent(root), rootLeaf.leafCount > 0 {
             return rootLeaf.leafCount
+        }
+        if let counter = leafStore as? LeafCounter {
+            return counter.count()
         }
 
         var count = 0
@@ -665,6 +849,39 @@ public class DagStore {
             count += 1
         }
         return count
+    }
+
+    public func updateParentHashesStreaming(batchSize: Int = 10) throws {
+        guard !root.isEmpty else {
+            throw DagError.brokenDag("no root set")
+        }
+
+        if !hasIndex() || getIndex() == nil {
+            try buildIndex()
+        }
+
+        guard let currentIndex = getIndex() else {
+            throw DagError.brokenDag("index not built")
+        }
+
+        let effectiveBatchSize = batchSize > 0 ? batchSize : 10
+        var batch: [DagLeaf] = []
+        batch.reserveCapacity(effectiveBatchSize)
+
+        for leafHash in currentIndex.leafHashes {
+            guard let leaf = try retrieveLeafWithoutContent(leafHash) else { continue }
+            leaf.parentHash = currentIndex.parents[leafHash] ?? ""
+            batch.append(leaf)
+
+            if batch.count >= effectiveBatchSize {
+                try storeLeavesInBatches(batch)
+                batch.removeAll(keepingCapacity: true)
+            }
+        }
+
+        if !batch.isEmpty {
+            try storeLeavesInBatches(batch)
+        }
     }
 
     // MARK: - Labels
@@ -719,9 +936,19 @@ public class MemoryLeafStore: LeafStore, BatchLeafStore, LeafCounter, LeafEnumer
 
     public init() {}
 
+    private func storeLeafUnlocked(_ leaf: DagLeaf) {
+        if leaf.content == nil, let existingContent = leaves[leaf.hash]?.content {
+            let merged = leaf.clone()
+            merged.content = existingContent
+            leaves[leaf.hash] = merged
+        } else {
+            leaves[leaf.hash] = leaf
+        }
+    }
+
     public func storeLeaf(_ leaf: DagLeaf) throws {
         lock.lock(); defer { lock.unlock() }
-        leaves[leaf.hash] = leaf
+        storeLeafUnlocked(leaf)
     }
 
     public func retrieveLeaf(_ hash: String) throws -> DagLeaf? {
@@ -748,7 +975,7 @@ public class MemoryLeafStore: LeafStore, BatchLeafStore, LeafCounter, LeafEnumer
 
     public func storeLeaves(_ leaves: [DagLeaf]) throws {
         lock.lock(); defer { lock.unlock() }
-        for leaf in leaves { self.leaves[leaf.hash] = leaf }
+        for leaf in leaves { storeLeafUnlocked(leaf) }
     }
 
     public func retrieveLeaves(_ hashes: [String]) throws -> [String: DagLeaf] {

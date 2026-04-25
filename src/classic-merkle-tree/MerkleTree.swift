@@ -60,17 +60,23 @@ public struct MerkleTreeConfig {
     public var mode: MerkleTreeMode
     public var sortSiblingPairs: Bool
     public var disableLeafHashing: Bool
+    public var runInParallel: Bool
+    public var numRoutines: Int
 
     public init(
         hashFunc: MerkleHashFunc? = nil,
         mode: MerkleTreeMode = .proofGen,
         sortSiblingPairs: Bool = false,
-        disableLeafHashing: Bool = false
+        disableLeafHashing: Bool = false,
+        runInParallel: Bool = false,
+        numRoutines: Int = 0
     ) {
         self.hashFunc = hashFunc
         self.mode = mode
         self.sortSiblingPairs = sortSiblingPairs
         self.disableLeafHashing = disableLeafHashing
+        self.runInParallel = runInParallel
+        self.numRoutines = numRoutines
     }
 }
 

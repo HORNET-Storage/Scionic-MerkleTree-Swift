@@ -173,7 +173,8 @@ private func processDirectory(
 
 private func processFile(
     fullPath: String, parentPath: String, dag: DagBuilder,
-    isRoot: Bool, additionalData: [String: String]?, processor: LeafProcessor?
+    isRoot: Bool, additionalData: [String: String]?, processor: LeafProcessor?,
+    threadSafeAdds: Bool = false
 ) throws -> DagLeaf {
     let relPath = relativePath(from: parentPath, to: fullPath)
 
@@ -193,6 +194,14 @@ private func processFile(
 
     let builder = DagLeafBuilder(name: relPath)
     builder.setType(.file)
+
+    func addChunkLeaf(_ leaf: DagLeaf) {
+        if threadSafeAdds {
+            dag.addLeafSafe(leaf, parent: nil)
+        } else {
+            dag.addLeaf(leaf, parent: nil)
+        }
+    }
 
     // Stream file in chunks
     var singleChunk: Data? = nil
@@ -217,7 +226,7 @@ private func processFile(
 
             let chunkLeaf = try chunkBuilder.buildLeaf(additionalData: nil)
             builder.addLink(chunkLeaf.hash)
-            dag.addLeaf(chunkLeaf, parent: nil)
+            addChunkLeaf(chunkLeaf)
             singleChunk = nil
         }
 
@@ -229,7 +238,7 @@ private func processFile(
 
         let chunkLeaf = try chunkBuilder.buildLeaf(additionalData: nil)
         builder.addLink(chunkLeaf.hash)
-        dag.addLeaf(chunkLeaf, parent: nil)
+        addChunkLeaf(chunkLeaf)
     }
 
     // Single chunk — set data directly on the file leaf
@@ -243,26 +252,29 @@ private func processFile(
 // MARK: - Stream File Chunks
 
 /// Reads a file in chunks using streaming I/O.
-/// If chunkSize <= 0, reads the entire file as a single chunk.
+/// If chunkSize <= 0, reads the entire file as a single fallback chunk.
 private func streamFileChunks(fullPath: String, chunkSize: Int, callback: (Data, Int) throws -> Void) throws {
     let fileURL = URL(fileURLWithPath: fullPath)
-    let fileData = try Data(contentsOf: fileURL)
 
-    // If no chunking or file fits in one chunk
-    if chunkSize <= 0 || fileData.count <= chunkSize {
-        try callback(fileData, 0)
+    if chunkSize <= 0 {
+        try callback(try Data(contentsOf: fileURL), 0)
         return
     }
 
-    // Stream in chunks
-    var offset = 0
-    var index = 0
+    let fileHandle = try FileHandle(forReadingFrom: fileURL)
+    defer { try? fileHandle.close() }
 
-    while offset < fileData.count {
-        let end = min(offset + chunkSize, fileData.count)
-        let chunk = fileData[offset..<end]
-        try callback(Data(chunk), index)
-        offset = end
+    var index = 0
+    while true {
+        let chunk = try fileHandle.read(upToCount: chunkSize) ?? Data()
+        if chunk.isEmpty {
+            if index == 0 {
+                try callback(Data(), 0)
+            }
+            return
+        }
+
+        try callback(chunk, index)
         index += 1
     }
 }
@@ -322,10 +334,11 @@ private func createDagParallel(path: String, additionalData: [String: String]?, 
             isRoot: true, additionalData: additionalData, processor: processor, config: config
         )
     } else {
-        // Single file — no parallelism benefit, use sequential
+        // Single file has no directory fan-out, but keep leaf insertion on the parallel-safe path.
         leaf = try processFile(
             fullPath: path, parentPath: parentPath, dag: dag,
-            isRoot: true, additionalData: additionalData, processor: processor
+            isRoot: true, additionalData: additionalData, processor: processor,
+            threadSafeAdds: true
         )
     }
 
@@ -431,7 +444,8 @@ private func processDirectoryParallel(
             } else {
                 childLeaf = try processFile(
                     fullPath: childFullPath, parentPath: fullPath, dag: dag,
-                    isRoot: false, additionalData: nil, processor: processor
+                    isRoot: false, additionalData: nil, processor: processor,
+                    threadSafeAdds: true
                 )
             }
             builder.addLink(childLeaf.hash)
@@ -475,7 +489,8 @@ private func processDirectoryParallel(
                 } else {
                     childLeaf = try processFile(
                         fullPath: childFullPath, parentPath: fullPath, dag: dag,
-                        isRoot: false, additionalData: nil, processor: processor
+                        isRoot: false, additionalData: nil, processor: processor,
+                        threadSafeAdds: true
                     )
                 }
 

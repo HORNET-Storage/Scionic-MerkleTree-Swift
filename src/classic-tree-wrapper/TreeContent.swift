@@ -1,6 +1,6 @@
-// TreeContent.swift — High-level key-value Merkle Tree wrapper
+// TreeContent.swift — Key/value wrapper around Classic Merkle Trees
 //
-// Ported from tree/tree.go. Wraps MerkleTree for convenient key->value usage.
+// Ported from Go's tree/tree.go. Wraps MerkleTree for convenient key->value usage.
 // Used by the DAG package to build Classic Merkle Trees from link lists.
 
 import Foundation

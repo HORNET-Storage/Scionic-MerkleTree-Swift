@@ -181,6 +181,22 @@ final class StoreStreamingTests: XCTestCase {
         }
     }
 
+    func testVerifyStreamingDoesNotMaterializeFullDag() throws {
+        try runTestWithAllFixtures { dag, fixture, _ in
+            let leafStore = MetadataOnlyLeafStore()
+            for leaf in dag.leafs.values {
+                try leafStore.storeLeaf(leaf)
+            }
+
+            let store = DagStore(root: dag.root, leafStore: leafStore)
+            store.leafCount = dag.leafs[dag.root]?.leafCount ?? dag.leafs.count
+
+            try store.verifyStreaming()
+            XCTAssertEqual(leafStore.retrieveLeafCalls, 0, fixture.name)
+            XCTAssertGreaterThan(leafStore.retrieveLeafWithoutContentCalls, 0, fixture.name)
+        }
+    }
+
     private func firstFileLeaf(in dag: Dag) -> DagLeaf? {
         return dag.leafs.values.first { $0.type == .file }
     }
@@ -192,5 +208,35 @@ final class StoreStreamingTests: XCTestCase {
         } catch {
             return false
         }
+    }
+}
+
+private final class MetadataOnlyLeafStore: LeafStore {
+    private var leaves: [String: DagLeaf] = [:]
+    private(set) var retrieveLeafCalls = 0
+    private(set) var retrieveLeafWithoutContentCalls = 0
+
+    func storeLeaf(_ leaf: DagLeaf) throws {
+        leaves[leaf.hash] = leaf.clone()
+    }
+
+    func retrieveLeaf(_ hash: String) throws -> DagLeaf? {
+        retrieveLeafCalls += 1
+        throw DagError.brokenDag("streaming verification materialized leaf \(hash)")
+    }
+
+    func retrieveLeafWithoutContent(_ hash: String) throws -> DagLeaf? {
+        retrieveLeafWithoutContentCalls += 1
+        guard let leaf = leaves[hash]?.clone() else { return nil }
+        leaf.content = nil
+        return leaf
+    }
+
+    func hasLeaf(_ hash: String) throws -> Bool {
+        return leaves[hash] != nil
+    }
+
+    func deleteLeaf(_ hash: String) throws {
+        leaves.removeValue(forKey: hash)
     }
 }

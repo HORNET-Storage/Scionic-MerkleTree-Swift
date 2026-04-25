@@ -14,7 +14,9 @@ Each layer builds on the previous. Start from Layer 1 and work up. A port that p
 - **Layer 2** — Verify your Classic Merkle Tree produces identical roots and proofs
 - **Layer 3** — Verify your leaf hashing pipeline (CBOR → SHA-256 → CID → base32lower) produces identical CID strings
 - **Layer 4** — Verify your DAG creation from a filesystem produces the identical root hash
-- **Layer 5** — Verify your DAG operations (verify, serialize, transmit, diff) work correctly
+- **Layer 5** — Verify your DAG operations (verify, serialize, transmit, diff, store, partial DAGs) work correctly
+
+The Swift port currently verifies this contract with **227 XCTest tests**, including the 12 direct cross-compatibility vector tests plus fixture root, true file streaming, store index/cache/update APIs, store streaming, serialization, partial-DAG, batched-transmission, DAG parallel multi-chunk-file, and classic-tree parallel proof-update parity regressions.
 
 ---
 
@@ -139,6 +141,10 @@ For tree `["a", "b"]`:
 |-----------|------|--------------|
 | 0 ("a") | 1 | `3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d` (SHA-256 of "b") |
 | 1 ("b") | 0 | `ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb` (SHA-256 of "a") |
+
+### 2.3 Parallel Mode
+
+Ports with a parallel mode must produce byte-identical roots, leaves, internal nodes, proof paths, and proof siblings compared with sequential mode. Go exposes `RunInParallel` and `NumRoutines`; Swift mirrors these as `runInParallel` and `numRoutines`, including parallel leaf hashing, parent hashing, and proof updates.
 
 ---
 
@@ -317,6 +323,38 @@ Configuration: `ChunkSize = 4096`, `timestampRoot = false`
 
 Total leaves: **12**
 
+### 4.3 Standard Fixture Root Matrix
+
+These fixtures exercise small files, chunked files, flat directories, nested directories, deep hierarchies, and mixed file sizes. All use `ChunkSize = 4096` and `timestampRoot = false`.
+
+| Fixture | Root CID | Leaves | Chunk Leaves | Content Size | DAG Size |
+|---------|----------|--------|--------------|--------------|----------|
+| `single_small_file` | `bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe` | 2 | 0 | 1,024 | 1,467 |
+| `single_large_file` | `bafireighsz3l24ndzdt4vthraeydfc3ilzajmj56ozbcjav2oablln2zzy` | 5 | 3 | 10,240 | 11,611 |
+| `flat_directory` | `bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u` | 6 | 0 | 4,608 | 6,005 |
+| `nested_directory` | `bafireiekzu7qss4gcgk3ochl3ehk3ee3rmsqjdh7bin4twzdhkgsfw2kme` | 7 | 0 | 5,120 | 7,015 |
+| `deep_hierarchy` | `bafireifzuzba5kihvbxfl5ygrse5pca6aamzumemmrjm32yyl5j4cjdj3u` | 11 | 0 | 3,840 | 7,120 |
+| `mixed_sizes` | `bafireigsytb3lqy7xxuq53376n4xypeyyn3f6a4hnznxso4r52aeobjpsi` | 12 | 6 | 26,752 | 30,009 |
+
+### 4.4 Nested Chunked File on Windows Paths
+
+A nested file larger than the chunk size must use Go-compatible chunk item names. On Windows, `filepath.Join(relPath, index)` places backslashes into chunk `ItemName` values, and those bytes affect the root hash.
+
+Fixture:
+
+```
+input/
+└── nested/
+    └── inner/
+        └── large.bin  (10,000 bytes: UInt8(index % 251))
+```
+
+Windows reference values:
+
+| Root CID | Leaves | Chunk Leaves | Content Size | DAG Size |
+|----------|--------|--------------|--------------|----------|
+| `bafireifmsypsphu6rwh46fnkhma5kzxwrhdgqog7fardsg5p3bpuiu6kxe` | 7 | 3 | 10,000 | 12,026 |
+
 ---
 
 ## Layer 5: DAG Operations
@@ -325,8 +363,11 @@ Once your port creates DAGs with matching root hashes, verify these operations:
 
 ### 5.1 Verification
 - `dag.Verify()` passes on the DAGs from Layer 4
+- `DagStore.Verify()` and `DagStore.VerifyStreaming()` pass for full DAGs
+- `DagStore.VerifyStreaming()` verifies through metadata-first store access and does not materialize the full DAG with `ToDag()`
+- `DagStore.VerifyStreaming()` verifies partial DAGs using stored Merkle proofs instead of requiring all children to exist locally
 - Tampered leaf content causes verification to fail
-- Tampered ContentSize/DagSize on root causes verification to fail
+- Tampered `ContentSize` or `DagSize` on root causes verification to fail when full DAG size validation is possible
 
 ### 5.2 Directory Recreation
 - `dag.CreateDirectory(outputPath)` recreates all files with exact original content
@@ -337,11 +378,18 @@ Once your port creates DAGs with matching root hashes, verify these operations:
 - `dag.ToJSON()` → `Dag.FromJSON(data)` → `restored.Verify()` passes
 - `dag.ToCBOR()` → `Dag.FromCBOR(data)` → `restored.Verify()` passes
 - Root hash is preserved through serialization
+- Partial DAG JSON round-trips preserve stored proof keys, proof leaf values, siblings, and path bits
 
 ### 5.4 Transmission
 - `dag.GetLeafSequence()` produces packets in BFS order (root first)
 - Applying all packets to an empty DAG reconstructs the original
 - Each packet's leaf can be independently verified
+- `DagStore.AddTransmissionPacket()` verifies root leaves, child leaves, parent links, and required Merkle proofs before storing
+- Batched transmission packets round-trip through JSON and CBOR
+- Batch-size checks use the CBOR-encoded packet size, not JSON text size
+- Applying batched packets to an empty `Dag` reconstructs and verifies the original
+- Applying batched packets to an empty `DagStore` reconstructs and passes `VerifyStreaming()`
+- Partial DAG batched transmission preserves the original partial parent proofs when not all children are present in a batch
 
 ### 5.5 Labels
 - `dag.CalculateLabels()` assigns deterministic numeric labels
@@ -358,6 +406,13 @@ Once your port creates DAGs with matching root hashes, verify these operations:
 - Partial DAG has fewer leaves than full DAG
 - `partial.IsPartial()` returns true
 - `partial.Verify()` passes using stored Merkle proofs
+- Partial DAGs with single retained leaves and proof-bearing retained leaves both serialize, transmit, and verify
+
+### 5.8 Store Index and Parent Hash Updates
+- `DagStore.BuildIndex()` builds parent-before-child traversal order from either cached child→parent relationships or BFS traversal
+- `HasIndex`, `GetIndex`, `ClearIndex`, `AddToIndex`, and `MarkIndexBuilt` match the Go store lifecycle
+- `IterateDagWithIndex()` returns leaf hashes and parent hashes without loading leaf content
+- `UpdateParentHashesStreaming(batchSize)` updates stored parent hashes in bounded batches and preserves existing in-memory content
 
 ---
 
@@ -385,6 +440,10 @@ When a file exceeds `ChunkSize`, chunks are named by joining the relative path w
 - `filepath.Join(relPath, "1")` for chunk 1
 - etc.
 
+The path separator is hash-visible because the chunk `ItemName` is part of the leaf hash:
+- Windows: `large.bin\0`, `nested\inner\large.bin\1`
+- POSIX: `large.bin/0`, `nested/inner/large.bin/1`
+
 Single-chunk files store data directly on the file leaf (no child chunks created).
 
 ### Link ordering
@@ -395,6 +454,14 @@ Single-chunk files store data directly on the file leaf (no child chunks created
 ### Classic Merkle Tree inside parent leaves
 
 When a leaf has >1 child link, a Classic Merkle Tree is built from the link hashes (key = hash, value = hash). The tree's root becomes `ClassicMerkleRoot`. When a leaf has exactly 1 child, `ClassicMerkleRoot` = raw UTF-8 bytes of the child's CID string.
+
+### Streaming file creation
+
+Ports must read chunked files incrementally. Loading the full file into memory and then slicing it can still produce correct hashes, but it is not acceptable for mobile-scale parity with the Go implementation.
+
+### Store-backed streaming verification
+
+`DagStore.VerifyStreaming()` must verify via store APIs. Root CID verification may run without a full DAG; ContentSize/DagSize recalculation is reserved for callers that already have a full DAG in memory.
 
 ---
 
@@ -419,7 +486,7 @@ These test files are in `tests/crosscompat_*.go`.
 | Language | Status | Repository |
 |----------|--------|-----------|
 | **Go** | ✅ Reference implementation | [HORNET-Storage/Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) |
-| **Swift** | ✅ Complete (101 tests, 12 cross-compat) | This repository |
+| **Swift** | ✅ Complete (227 tests, 12 direct cross-compat plus fixture/store/index/streaming/transmission/parallel parity) | This repository |
 | Rust | — | — |
 | TypeScript | — | — |
 | Python | — | — |

@@ -289,4 +289,87 @@ final class MerkleTreeTests: XCTestCase {
         XCTAssertTrue(exists)
         XCTAssertGreaterThanOrEqual(idx, 0)
     }
+
+    // MARK: - Parallel Build Parity
+
+    func testParallelProofAndTreeBuildMatchesSequential() throws {
+        let blocks = makeParallelBlocks(count: 257)
+        let sequentialConfig = MerkleTreeConfig(mode: .proofGenAndTreeBuild)
+        let parallelConfig = MerkleTreeConfig(
+            mode: .proofGenAndTreeBuild,
+            runInParallel: true,
+            numRoutines: 4
+        )
+
+        let sequential = try MerkleTree.build(config: sequentialConfig, blocks: blocks)
+        let parallel = try MerkleTree.build(config: parallelConfig, blocks: blocks)
+
+        XCTAssertEqual(parallel.root, sequential.root)
+        XCTAssertEqual(parallel.keys, sequential.keys)
+        XCTAssertEqual(parallel.leafHashes, sequential.leafHashes)
+        XCTAssertEqual(parallel.nodes, sequential.nodes)
+        assertProofsEqual(parallel.proofs, sequential.proofs)
+
+        for i in 0..<parallel.numLeaves {
+            try parallel.verify(dataBlock: blocks[parallel.keys[i]]!, proof: parallel.proofs[i])
+        }
+    }
+
+    func testParallelProofGenerationMatchesSequential() throws {
+        let blocks = makeParallelBlocks(count: 129)
+        let sequential = try MerkleTree.build(config: MerkleTreeConfig(mode: .proofGen), blocks: blocks)
+        let parallel = try MerkleTree.build(
+            config: MerkleTreeConfig(mode: .proofGen, runInParallel: true, numRoutines: 3),
+            blocks: blocks
+        )
+
+        XCTAssertEqual(parallel.root, sequential.root)
+        XCTAssertEqual(parallel.keys, sequential.keys)
+        XCTAssertEqual(parallel.leafHashes, sequential.leafHashes)
+        assertProofsEqual(parallel.proofs, sequential.proofs)
+
+        for i in 0..<parallel.numLeaves {
+            try parallel.verify(dataBlock: blocks[parallel.keys[i]]!, proof: parallel.proofs[i])
+        }
+    }
+
+    func testParallelProofUpdatesMatchSequentialAcrossWorkerCounts() throws {
+        let blocks = makeParallelBlocks(count: 511)
+        let sequentialProofOnly = try MerkleTree.build(config: MerkleTreeConfig(mode: .proofGen), blocks: blocks)
+        let sequentialWithTree = try MerkleTree.build(config: MerkleTreeConfig(mode: .proofGenAndTreeBuild), blocks: blocks)
+
+        for workers in [2, 3, 5, 8] {
+            let parallelProofOnly = try MerkleTree.build(
+                config: MerkleTreeConfig(mode: .proofGen, runInParallel: true, numRoutines: workers),
+                blocks: blocks
+            )
+            let parallelWithTree = try MerkleTree.build(
+                config: MerkleTreeConfig(mode: .proofGenAndTreeBuild, runInParallel: true, numRoutines: workers),
+                blocks: blocks
+            )
+
+            XCTAssertEqual(parallelProofOnly.root, sequentialProofOnly.root, "proofGen root changed with workers=\(workers)")
+            XCTAssertEqual(parallelWithTree.root, sequentialWithTree.root, "proofGenAndTreeBuild root changed with workers=\(workers)")
+            assertProofsEqual(parallelProofOnly.proofs, sequentialProofOnly.proofs)
+            assertProofsEqual(parallelWithTree.proofs, sequentialWithTree.proofs)
+            XCTAssertEqual(parallelWithTree.nodes, sequentialWithTree.nodes)
+        }
+    }
+
+    private func makeParallelBlocks(count: Int) -> [String: DataBlock] {
+        var blocks: [String: DataBlock] = [:]
+        for i in 0..<count {
+            let key = "parallel_\(String(format: "%04d", i))"
+            blocks[key] = TestBlock(data: "parallel_data_\(i)_\(i * 31)")
+        }
+        return blocks
+    }
+
+    private func assertProofsEqual(_ lhs: [Proof], _ rhs: [Proof], file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(lhs.count, rhs.count, file: file, line: line)
+        for (left, right) in zip(lhs, rhs) {
+            XCTAssertEqual(left.path, right.path, file: file, line: line)
+            XCTAssertEqual(left.siblings, right.siblings, file: file, line: line)
+        }
+    }
 }

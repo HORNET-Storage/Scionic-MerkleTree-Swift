@@ -24,12 +24,12 @@ let package = Package(
             dependencies: [
                 .product(name: "Crypto", package: "swift-crypto"),
             ],
-            path: "Sources/ScionicMerkleTree"
+            path: "src"
         ),
         .testTarget(
             name: "ScionicMerkleTreeTests",
             dependencies: ["ScionicMerkleTree"],
-            path: "Tests/ScionicMerkleTreeTests"
+            path: "tests"
         ),
     ]
 )

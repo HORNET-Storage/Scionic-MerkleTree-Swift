@@ -6,32 +6,32 @@ A comprehensive Swift port of [Scionic-Merkle-Tree](https://github.com/HORNET-St
 
 ## What’s Ported
 
-This is a near-complete port of the Go library. **17 source files, ~6,300 lines of Swift, 93 tests.**
+This is a near-complete port of the Go library. **18 source files, 227 tests.**
 
 ### Core (fully ported)
 
 | Go File | Swift File | Status | Description |
 |---------|-----------|--------|-------------|
-| `dag/types.go` | `Dag/Types.swift` | ✅ Complete | All types: Dag, DagLeaf, DagBuilder, DagLeafBuilder, ClassicTreeBranch, DagBranch, TransmissionPacket, BatchedTransmissionPacket, DagBuilderConfig, LeafType, LeafProcessor |
-| `dag/leaves.go` | `Dag/Leaves.swift` | ✅ Complete | BuildLeaf, BuildRootLeaf, VerifyLeaf, VerifyRootLeaf (with ContentSize/DagSize validation), VerifyChildrenAgainstMerkleRoot, GetBranch, VerifyBranch, HasLink, AddLink, Clone, EstimateSize |
-| `dag/dag.go` | `Dag/DagCreation.swift` + `DagVerification.swift` | ✅ Complete | CreateDag, CreateDagAdvanced, CreateDagCustom, CreateDagWithConfig, parallel creation (DispatchQueue worker pool), Verify (full + partial with Merkle proofs), IterateDag, CreateDirectory, GetContentFromLeaf, GetPartial, CalculateLabels, GetHashesByLabelRange, GetLabel, IsPartial |
-| `dag/serialize.go` | `Dag/Serialization.swift` | ✅ Complete | ToJSON, FromJSON, ToCBOR, FromCBOR, ReadDag, ToSerializable, FromSerializable (rebuilds Merkle trees + parent hashes) |
-| `dag/transmission.go` | `Dag/Transmission.swift` | ✅ Complete | GetLeafSequence (BFS with proofs), VerifyTransmissionPacket, ApplyTransmissionPacket, ApplyAndVerifyTransmissionPacket, RemoveAllContent, GetBatchedLeafSequence (size-limited batches), VerifyBatchedTransmissionPacket, ApplyBatchedTransmissionPacket, BatchedTransmissionPacket.GetRootLeaf |
-| `dag/store.go` | `Dag/Store.swift` | ✅ Complete | LeafStore, ContentStore, BatchLeafStore, BatchContentStore, LeafCounter, LeafEnumerator protocols. DagStore class with all operations. MemoryLeafStore + MemoryContentStore implementations |
-| `dag/utils.go` | `Dag/Utils.swift` | ✅ Complete | SortMapByKeys, SortMapForVerification, KeyValue, CalculateTotalContentSize, CalculateTotalDagSize |
-| `diff/diff.go` | `Diff/Diff.swift` | ✅ Complete | Diff, DiffFromNewLeaves, GetAddedLeaves, GetRemovedLeaves, ApplyToDAG, CreatePartialDag |
-| `merkletree/merkletree.go` | `MerkleTree/*.swift` | ✅ Complete | Full Classic Merkle Tree: build from map, proof generation, proof verification, configurable hash function, OpenZeppelin-compatible sorting, GetIndexForKey |
-| `tree/tree.go` | `Tree/TreeContent.swift` | ✅ Complete | TreeContent, TreeLeaf, Build, VerifyTree, VerifyRoot |
+| `dag/types.go` | `src/dag/Types.swift` | ✅ Complete | All types: Dag, DagLeaf, DagBuilder, DagLeafBuilder, ClassicTreeBranch, DagBranch, TransmissionPacket, BatchedTransmissionPacket, DagBuilderConfig, LeafType, LeafProcessor |
+| `dag/leaves.go` | `src/dag/Leaves.swift` | ✅ Complete | BuildLeaf, BuildRootLeaf, VerifyLeaf, VerifyRootLeaf (standalone root CID verification plus full-DAG ContentSize/DagSize validation), VerifyChildrenAgainstMerkleRoot, GetBranch, VerifyBranch, HasLink, AddLink, Clone, EstimateSize |
+| `dag/dag.go` | `src/dag/DagCreation.swift` + `src/dag/DagVerification.swift` | ✅ Complete | CreateDag, CreateDagAdvanced, CreateDagCustom, CreateDagWithConfig, true chunked file reads, parallel creation (DispatchQueue worker pool), Verify (full + partial with Merkle proofs), IterateDag, CreateDirectory, GetContentFromLeaf, GetPartial, CalculateLabels, GetHashesByLabelRange, GetLabel, IsPartial |
+| `dag/serialize.go` | `src/dag/Serialization.swift` | ✅ Complete | ToJSON, FromJSON, ToCBOR, FromCBOR, ReadDag, ToSerializable, FromSerializable (rebuilds Merkle trees + parent hashes) |
+| `dag/transmission.go` | `src/dag/Transmission.swift` | ✅ Complete | GetLeafSequence (BFS with proofs), VerifyTransmissionPacket, ApplyTransmissionPacket, ApplyAndVerifyTransmissionPacket, RemoveAllContent, GetBatchedLeafSequence (size-limited batches), VerifyBatchedTransmissionPacket, ApplyBatchedTransmissionPacket, BatchedTransmissionPacket.GetRootLeaf |
+| `dag/store.go` | `src/dag/Store.swift` | ✅ Complete | LeafStore, ContentStore, batch/count/enumerator/cache protocols, DagStore verification/streaming verification without full DAG materialization, index build/cache/iterate/update-parent-hash APIs, MemoryLeafStore + MemoryContentStore |
+| `dag/utils.go` | `src/dag/Utils.swift` | ✅ Complete | SortMapByKeys, SortMapForVerification, KeyValue, CalculateTotalContentSize, CalculateTotalDagSize |
+| `diff/diff.go` | `src/diff/Diff.swift` | ✅ Complete | Diff, DiffFromNewLeaves, GetAddedLeaves, GetRemovedLeaves, ApplyToDAG, CreatePartialDag |
+| `merkletree/merkletree.go` | `src/classic-merkle-tree/*.swift` | ✅ Complete | Full Classic Merkle Tree: build from map, proof generation, proof verification, configurable hash function, OpenZeppelin-compatible sorting, parallel leaf hashing, parent hashing, and proof updates via `runInParallel` + `numRoutines`, GetIndexForKey |
+| `tree/tree.go` | `src/classic-tree-wrapper/TreeContent.swift` | ✅ Complete | TreeContent, TreeLeaf, Build, VerifyTree, VerifyRoot |
 
 ### Internal (implemented from scratch, no external deps)
 
 | Component | Swift File | What it replaces |
 |-----------|-----------|------------------|
-| CBOR Encoder/Decoder | `Internal/CBOR.swift` | `fxamacker/cbor/v2` — deterministic encoding matching Go’s defaults |
-| CID Generation | `Internal/CID.swift` | `go-cid` + `go-multihash` + `go-multicodec` — CIDv1 with CBOR codec (0x51) + SHA2-256 |
-| Base32lower | `Internal/BaseEncoding.swift` | `go-multibase` — RFC 4648 lowercase, no padding |
-| Base58btc | `Internal/BaseEncoding.swift` | `mr-tron/base58` — Bitcoin-style encoding |
-| Varint | `Internal/Varint.swift` | `go-varint` — unsigned LEB128 |
+| CBOR Encoder/Decoder | `src/internal/CBOR.swift` | `fxamacker/cbor/v2` — deterministic encoding matching Go’s defaults |
+| CID Generation | `src/internal/CID.swift` | `go-cid` + `go-multihash` + `go-multicodec` — CIDv1 with CBOR codec (0x51) + SHA2-256 |
+| Base32lower | `src/internal/BaseEncoding.swift` | `go-multibase` — RFC 4648 lowercase, no padding |
+| Base58btc | `src/internal/BaseEncoding.swift` | `mr-tron/base58` — Bitcoin-style encoding |
+| Varint | `src/internal/Varint.swift` | `go-varint` — unsigned LEB128 |
 
 ## Cross-Compatibility Proof
 
@@ -70,10 +70,13 @@ Both produce root hash `bafireidb74bnd3jalcdjrog3sgnfdkxblqlphtkvbycksk3qpvrzbwz
 - **Directory support** — entire directory trees become Scionic Merkle DAGs, like IPFS
 - **Small Merkle branches** — logarithmic proof sizes via Classic Merkle Trees inside parent leaves
 - **LeafSync** — numbered leaves with label-based range queries for synchronization
-- **Streaming I/O** — files read in chunks, one chunk in memory at a time
+- **Streaming I/O** — files are read with `FileHandle` chunks, one chunk in memory at a time
+- **Storage-backed verification** — `DagStore.verifyStreaming()` verifies via metadata-first store access without calling `toDag()`
+- **Indexed storage traversal** — cache-backed `DagIndex` APIs support fast parent/child traversal and parent-hash updates
 - **Parallel creation** — `createDagWithConfig` with `enableParallel: true` uses DispatchQueue worker pools
+- **Parallel classic trees** — `MerkleTreeConfig(runInParallel:numRoutines:)` parallelizes leaf and parent-node hashing
 - **Verification** — full DAG verification + partial DAG verification with stored Merkle proofs
-- **ContentSize/DagSize validation** — root leaf recalculates and verifies sizes from children
+- **ContentSize/DagSize validation** — root leaf recalculates and verifies sizes from children when a full DAG is available
 - **Serialization** — JSON and CBOR round-trip through SerializableDag intermediate
 - **Transmission** — individual packets (GetLeafSequence) and batched packets (GetBatchedLeafSequence)
 - **Diffing** — compute diffs between DAG versions, apply diffs, create partial DAGs from diffs
@@ -178,25 +181,25 @@ let dag = try createDagWithConfig(path: "/large/directory", config: config)
 ## Architecture
 
 ```
-Sources/ScionicMerkleTree/
-├── Internal/             — CBOR, CID, Base encodings, Varint (zero deps)
-├── MerkleTree/           — Classic Merkle Tree (ported from go-merkletree)
-├── Tree/                 — Key-value Merkle Tree wrapper
-├── Dag/                  — Types, leaves, creation, verification, serialization, transmission, store
-└── Diff/                 — DAG diffing and patching
+src/
+├── dag/                  — Scionic DAG types, leaves, creation, verification, serialization, transmission, store
+├── diff/                 — DAG diffing and patching
+├── internal/             — CBOR, CID, Base encodings, Varint
+├── classic-merkle-tree/  — Classic Merkle Tree proof generation/verification
+├── classic-tree-wrapper/ — Key/value wrapper around Classic Merkle Trees
+├── testutil/             — Fixture builders used by parity tests
+└── ScionicMerkleTree.swift
 
-Tests/ScionicMerkleTreeTests/
-├── CBORTests             — CBOR encoding/decoding determinism
-├── CIDTests              — varint, base32, base58, CID generation
-├── MerkleTreeTests       — Classic Merkle Tree build/verify/proof behavior
-├── TreeContentTests      — Go tree wrapper parity for build and verify helpers
-├── AuditTests            — clone, serialization, store, transmission, diff, partial flows
-├── FixtureTests          — standard fixture coverage across DAG operations
-├── TransmissionTests     — batched transmission apply/verify regressions
-├── CrossCompatTests      — Merkle tree roots/proofs match Go
-├── CrossCompatLeafTests  — leaf CIDs match Go
-├── CrossCompatDagTests   — full DAG root/verify/recreate match Go
-└── CrossCompatDeepTests  — deep directory compatibility pipeline
+tests/
+├── diff/                 — DAG diff/apply tests
+├── classic-tree-wrapper/ — Go tree wrapper parity tests
+├── tests/                — Go-style integration, DAG, partial, store, store-index, streaming, transmission, fixture, and cross-compat tests
+├── AuditTests.swift      — clone, serialization, store, transmission, diff, partial flows
+├── FixtureTests.swift    — standard fixture coverage across DAG operations
+├── MerkleTreeTests.swift — classic Merkle Tree build/verify/proof behavior, including parallel/sequential parity
+├── TreeContentTests.swift — Classic tree wrapper parity for build and verify helpers
+├── CBORTests.swift       — CBOR encoding/decoding determinism
+└── CIDTests.swift        — varint, base32, base58, CID generation
 ```
 
 ## Dependencies
@@ -209,12 +212,12 @@ Tests/ScionicMerkleTreeTests/
 
 ## What Remains
 
-The port covers all core functionality, including packet serialization, fixture coverage, TreeContent wrapper parity, public transmission replay, diff apply, and partial DAG verification. A few secondary items remain:
+The critical Go parity gaps from the store/streaming/classic-tree sweep are now covered in Swift. Remaining work should be treated as ongoing hardening rather than known missing core behavior:
 
 | Item | Priority | Description |
 |------|----------|-------------|
-| Broader Go parity sweep | Low | Continue comparing less-central Go edge-case files as new APIs are ported |
-| Streaming verification | Low | Go’s DagStore has `VerifyStreaming` without loading the full DAG |
+| Broader Go parity sweep | Low | Continue adding edge-case vectors as the Go implementation evolves |
+| Backend-specific integration tests | Low | Exercise custom persistent LeafStore/ContentStore implementations beyond the in-memory stores |
 
 ## How Compatibility Works
 

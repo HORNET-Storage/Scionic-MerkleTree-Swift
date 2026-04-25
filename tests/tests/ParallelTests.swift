@@ -43,4 +43,22 @@ final class ParallelTests: XCTestCase {
             try parallel.verify()
         }
     }
+
+    func testParallelMultiChunkFilesMatchSequentialRepeatedly() throws {
+        let root = try ParityTestHelpers.makeTempDir("parallel_multichunk_files")
+        for i in 0..<12 {
+            try ParityTestHelpers.writeData(
+                ParityTestHelpers.join(root, "large_\(String(format: "%02d", i)).bin"),
+                ParityTestHelpers.deterministicData(size: defaultChunkSize * 2 + 97 + i)
+            )
+        }
+
+        let sequential = try createDag(path: root)
+        for _ in 0..<5 {
+            let parallel = try createDagWithConfig(path: root, config: .parallelConfig(workers: 6))
+            XCTAssertEqual(parallel.root, sequential.root)
+            ParityTestHelpers.assertSameLeafSet(sequential, parallel)
+            try parallel.verify()
+        }
+    }
 }
