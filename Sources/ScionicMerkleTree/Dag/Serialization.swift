@@ -334,3 +334,228 @@ func cborToSerializableProof(_ value: CBORValue) -> SerializableProof {
 
     return sp
 }
+
+// MARK: - Serializable Packet Types (Codable)
+
+public struct SerializableTransmissionPacket: Codable {
+    public var leaf: SerializableDagLeaf = SerializableDagLeaf()
+    public var parentHash: String = ""
+    public var proofs: [String: SerializableProof]? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case leaf = "Leaf"
+        case parentHash = "ParentHash"
+        case proofs
+    }
+}
+
+public struct SerializableBatchedTransmissionPacket: Codable {
+    public var leaves: [SerializableDagLeaf] = []
+    public var relationships: [String: String] = [:]
+    public var packetIndex: Int = 0
+    public var totalPackets: Int = 0
+
+    enum CodingKeys: String, CodingKey {
+        case leaves = "Leaves"
+        case relationships = "Relationships"
+        case packetIndex = "PacketIndex"
+        case totalPackets = "TotalPackets"
+    }
+}
+
+// MARK: - TransmissionPacket Serialization
+
+extension TransmissionPacket {
+
+    public func toSerializable() -> SerializableTransmissionPacket {
+        var s = SerializableTransmissionPacket()
+        s.leaf = dagLeafToSerializable(leaf)
+        s.parentHash = parentHash
+        if !proofs.isEmpty {
+            var sp: [String: SerializableProof] = [:]
+            for (k, v) in proofs {
+                sp[k] = SerializableProof(leaf: v.leaf, siblings: v.proof.siblings, path: v.proof.path)
+            }
+            s.proofs = sp
+        }
+        return s
+    }
+
+    public func toJSON() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(toSerializable())
+    }
+
+    public func toCBOR() -> Data {
+        let s = toSerializable()
+        let cborEncoder = CBOREncoder()
+        var proofPairs: [(String, CBORValue)] = []
+        if let sp = s.proofs {
+            for (k, v) in sp {
+                proofPairs.append((k, serializableProofToCBOR(v)))
+            }
+        }
+        return cborEncoder.encodeMap([
+            ("Leaf", serializableDagLeafToCBOR(s.leaf)),
+            ("ParentHash", .textString(s.parentHash)),
+            ("proofs", proofPairs.isEmpty ? .null : .map(CBOROrderedMap(proofPairs))),
+        ])
+    }
+
+    public static func fromJSON(_ data: Data) throws -> TransmissionPacket {
+        let decoder = JSONDecoder()
+        let s = try decoder.decode(SerializableTransmissionPacket.self, from: data)
+        return transmissionPacketFromSerializable(s)
+    }
+
+    public static func fromCBOR(_ data: Data) throws -> TransmissionPacket {
+        let decoder = CBORDecoder()
+        let value = try decoder.decode(data)
+        guard let map = value.mapValue else {
+            throw DagError.brokenDag("CBOR packet is not a map")
+        }
+        var s = SerializableTransmissionPacket()
+        if let leafVal = map["Leaf"] { s.leaf = cborToSerializableDagLeaf(leafVal) }
+        s.parentHash = map["ParentHash"]?.stringValue ?? ""
+        if let proofsMap = map["proofs"]?.mapValue {
+            var sp: [String: SerializableProof] = [:]
+            for pair in proofsMap.pairs {
+                sp[pair.key] = cborToSerializableProof(pair.value)
+            }
+            s.proofs = sp
+        }
+        return transmissionPacketFromSerializable(s)
+    }
+}
+
+// MARK: - BatchedTransmissionPacket Serialization
+
+extension BatchedTransmissionPacket {
+
+    public func toSerializable() -> SerializableBatchedTransmissionPacket {
+        var s = SerializableBatchedTransmissionPacket()
+        s.leaves = leaves.map { dagLeafToSerializable($0) }
+        s.relationships = relationships
+        s.packetIndex = packetIndex
+        s.totalPackets = totalPackets
+        return s
+    }
+
+    public func toJSON() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(toSerializable())
+    }
+
+    public func toCBOR() -> Data {
+        let s = toSerializable()
+        let encoder = CBOREncoder()
+        let leavesValue = CBORValue.array(s.leaves.map { serializableDagLeafToCBOR($0) })
+        let relationshipPairs = s.relationships
+            .sorted { $0.key < $1.key }
+            .map { ($0.key, CBORValue.textString($0.value)) }
+
+        return encoder.encodeMap([
+            ("Leaves", leavesValue),
+            ("Relationships", .map(CBOROrderedMap(relationshipPairs))),
+        ])
+    }
+
+    public static func fromCBOR(_ data: Data) throws -> BatchedTransmissionPacket {
+        let decoder = CBORDecoder()
+        let value = try decoder.decode(data)
+        guard let map = value.mapValue else {
+            throw DagError.brokenDag("CBOR batched packet is not a map")
+        }
+
+        var s = SerializableBatchedTransmissionPacket()
+        if let leavesArray = map["Leaves"]?.arrayValue {
+            s.leaves = leavesArray.map { cborToSerializableDagLeaf($0) }
+        }
+        if let relationshipMap = map["Relationships"]?.mapValue {
+            for pair in relationshipMap.pairs {
+                if let value = pair.value.stringValue {
+                    s.relationships[pair.key] = value
+                }
+            }
+        }
+        s.packetIndex = map["PacketIndex"]?.intValue ?? 0
+        s.totalPackets = map["TotalPackets"]?.intValue ?? 0
+        return batchedPacketFromSerializable(s)
+    }
+
+    public static func fromJSON(_ data: Data) throws -> BatchedTransmissionPacket {
+        let decoder = JSONDecoder()
+        let s = try decoder.decode(SerializableBatchedTransmissionPacket.self, from: data)
+        return batchedPacketFromSerializable(s)
+    }
+}
+
+// MARK: - Packet Conversion Helpers
+
+func dagLeafToSerializable(_ leaf: DagLeaf) -> SerializableDagLeaf {
+    var s = SerializableDagLeaf()
+    s.hash = leaf.hash
+    s.itemName = leaf.itemName
+    s.type = leaf.type.rawValue
+    s.contentHash = leaf.contentHash
+    s.content = leaf.content
+    s.classicMerkleRoot = leaf.classicMerkleRoot.isEmpty ? nil : leaf.classicMerkleRoot
+    s.currentLinkCount = leaf.currentLinkCount
+    s.leafCount = leaf.leafCount
+    s.contentSize = leaf.contentSize
+    s.dagSize = leaf.dagSize
+    s.links = leaf.links
+    s.additionalData = sortMapByKeys(leaf.additionalData)
+    if !leaf.proofs.isEmpty {
+        var sp: [String: SerializableProof] = [:]
+        for (k, v) in leaf.proofs {
+            sp[k] = SerializableProof(leaf: v.leaf, siblings: v.proof.siblings, path: v.proof.path)
+        }
+        s.storedProofs = sp
+    }
+    return s
+}
+
+func serializableToDagLeaf(_ s: SerializableDagLeaf) -> DagLeaf {
+    let leaf = DagLeaf()
+    leaf.hash = s.hash
+    leaf.itemName = s.itemName
+    leaf.type = LeafType(rawValue: s.type) ?? .file
+    leaf.contentHash = s.contentHash
+    leaf.content = s.content
+    leaf.classicMerkleRoot = s.classicMerkleRoot ?? Data()
+    leaf.currentLinkCount = s.currentLinkCount
+    leaf.leafCount = s.leafCount
+    leaf.contentSize = s.contentSize
+    leaf.dagSize = s.dagSize
+    leaf.links = s.links
+    leaf.additionalData = sortMapByKeys(s.additionalData)
+    if let sp = s.storedProofs {
+        for (k, v) in sp {
+            leaf.proofs[k] = ClassicTreeBranch(leaf: v.leaf, proof: Proof(siblings: v.siblings, path: v.path))
+        }
+    }
+    return leaf
+}
+
+func transmissionPacketFromSerializable(_ s: SerializableTransmissionPacket) -> TransmissionPacket {
+    let leaf = serializableToDagLeaf(s.leaf)
+    var proofs: [String: ClassicTreeBranch] = [:]
+    if let sp = s.proofs {
+        for (k, v) in sp {
+            proofs[k] = ClassicTreeBranch(leaf: v.leaf, proof: Proof(siblings: v.siblings, path: v.path))
+        }
+    }
+    return TransmissionPacket(leaf: leaf, parentHash: s.parentHash, proofs: proofs)
+}
+
+func batchedPacketFromSerializable(_ s: SerializableBatchedTransmissionPacket) -> BatchedTransmissionPacket {
+    return BatchedTransmissionPacket(
+        leaves: s.leaves.map { serializableToDagLeaf($0) },
+        relationships: s.relationships,
+        packetIndex: s.packetIndex,
+        totalPackets: s.totalPackets
+    )
+}

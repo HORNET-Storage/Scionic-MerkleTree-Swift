@@ -162,7 +162,6 @@ public class DagLeaf {
         // merkleTree and leafMap are transient, not cloned
         c.proofs = proofs
         return c
-        return c
     }
 
     /// Returns approximate serialized size without full CBOR encoding.

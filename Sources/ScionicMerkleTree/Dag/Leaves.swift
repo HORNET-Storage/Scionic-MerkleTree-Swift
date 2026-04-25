@@ -154,6 +154,16 @@ extension DagLeafBuilder {
             contentHashBytes = Data(hash)
         }
 
+        let sortedAdditionalData = sortMapByKeys(additionalData)
+        let sortedKV = sortMapForVerification(sortedAdditionalData)
+
+        let additionalDataCBOR: CBORValue
+        if let kv = sortedKV {
+            additionalDataCBOR = .array(kv.map { $0.toCBOR() })
+        } else {
+            additionalDataCBOR = .null
+        }
+
         // First pass: serialize temp root to calculate its size (with DagSize=0)
         let tempSerialized = cborEncoder.encodeMap([
             ("ItemName", .textString(itemName)),
@@ -164,20 +174,10 @@ extension DagLeafBuilder {
             ("ContentSize", .int64(contentSize)),
             ("DagSize", .int64(0)),
             ("ContentHash", .optionalBytes(contentHashBytes)),
-            ("AdditionalData", .null),
+            ("AdditionalData", additionalDataCBOR),
         ])
         let rootLeafSize = Int64(tempSerialized.count)
         let finalDagSize = childrenDagSize + rootLeafSize
-
-        let sortedAdditionalData = sortMapByKeys(additionalData)
-        let sortedKV = sortMapForVerification(sortedAdditionalData)
-
-        let additionalDataCBOR: CBORValue
-        if let kv = sortedKV {
-            additionalDataCBOR = .array(kv.map { $0.toCBOR() })
-        } else {
-            additionalDataCBOR = .null
-        }
 
         // Final serialization with correct DagSize
         let serialized = cborEncoder.encodeMap([
@@ -460,4 +460,35 @@ func buildLeafSizeStruct(_ leaf: DagLeaf) -> [(String, CBORValue)] {
         ("Links", linksValue),
         ("AdditionalData", additionalDataValue),
     ]
+}
+
+// MARK: - DagLeaf Directory Recreation (API compat with Go)
+
+extension DagLeaf {
+    /// Recreates a file or directory from this leaf.
+    ///
+    /// Mirrors Go's `DagLeaf.CreateDirectoryLeaf(path, dag)`.
+    /// Delegates to Dag's internal implementation.
+    public func createDirectoryLeaf(path: String, dag: Dag) throws {
+        let fm = FileManager.default
+
+        switch type {
+        case .directory:
+            try fm.createDirectory(atPath: path, withIntermediateDirectories: true)
+            for link in links {
+                guard let childLeaf = dag.leafs[link] else {
+                    throw DagError.invalidLink(link)
+                }
+                let childPath = (path as NSString).appendingPathComponent(childLeaf.itemName)
+                try childLeaf.createDirectoryLeaf(path: childPath, dag: dag)
+            }
+
+        case .file:
+            let content = try dag.getContentFromLeaf(self)
+            try content.write(to: URL(fileURLWithPath: path))
+
+        case .chunk:
+            break // Chunks are handled by their parent file leaf
+        }
+    }
 }

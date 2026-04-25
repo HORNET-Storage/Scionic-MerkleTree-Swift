@@ -130,16 +130,15 @@ extension Dag {
 
     /// Applies a transmission packet to this DAG.
     ///
-    /// Adds the leaf, establishes parent link, and stores proofs.
+    /// Adds the leaf, establishes parent link, stores proofs, and records the root packet.
     public func applyTransmissionPacket(_ packet: TransmissionPacket) {
         leafs[packet.leaf.hash] = packet.leaf
 
-        // Establish parent-child link
-        if !packet.parentHash.isEmpty {
-            if let parent = leafs[packet.parentHash] {
-                if !parent.hasLink(packet.leaf.hash) {
-                    parent.addLink(packet.leaf.hash)
-                }
+        if packet.parentHash.isEmpty {
+            root = packet.leaf.hash
+        } else if let parent = leafs[packet.parentHash] {
+            if !parent.hasLink(packet.leaf.hash) {
+                parent.addLink(packet.leaf.hash)
             }
         }
 
@@ -259,13 +258,35 @@ extension Dag {
 
     /// Generates Merkle proofs for parent leaves in a batch.
     private func finalizeBatch(_ batch: inout BatchedTransmissionPacket, parentsInBatch: Set<String>) {
+        var parentChildrenInBatch: [String: [String]] = [:]
+        for (childHash, parentHash) in batch.relationships where !parentHash.isEmpty {
+            parentChildrenInBatch[parentHash, default: []].append(childHash)
+        }
+
+        let partial = isPartial()
+
         for parentHash in parentsInBatch {
             guard let parentLeaf = batch.leaves.first(where: { $0.hash == parentHash }) else { continue }
-            guard parentLeaf.currentLinkCount > 1 else { continue }
+            guard let originalParent = leafs[parentHash] else { continue }
 
-            // Build merkle tree from parent's links
+            let totalChildren = originalParent.currentLinkCount
+            guard totalChildren > 1 else { continue }
+
+            let childrenInThisBatch = parentChildrenInBatch[parentHash] ?? []
+            if childrenInThisBatch.count == totalChildren {
+                parentLeaf.proofs = [:]
+                continue
+            }
+
+            if partial {
+                guard !originalParent.proofs.isEmpty else { continue }
+                parentLeaf.proofs = originalParent.proofs
+                continue
+            }
+
+            // Full DAG: build the Merkle tree from the original parent's complete links.
             let builder = TreeContent()
-            var sortedLinks = parentLeaf.links
+            var sortedLinks = originalParent.links
             sortedLinks.sort()
             for link in sortedLinks {
                 builder.addLeaf(key: link, data: link)
@@ -273,7 +294,6 @@ extension Dag {
 
             guard let (merkleTree, _) = try? builder.build() else { continue }
 
-            // Generate proofs for all children
             if parentLeaf.proofs.isEmpty {
                 parentLeaf.proofs = [:]
             }
@@ -324,8 +344,6 @@ extension Dag {
 
     /// Applies a batched transmission packet to this DAG.
     public func applyBatchedTransmissionPacket(_ packet: BatchedTransmissionPacket) {
-        var parentsToUpdate = Set<String>()
-
         for leaf in packet.leaves {
             if let existing = leafs[leaf.hash] {
                 // Merge proofs from incoming leaf
@@ -342,12 +360,12 @@ extension Dag {
                 leafs[leaf.hash] = leaf
             }
 
-            if let parentHash = packet.relationships[leaf.hash], !parentHash.isEmpty {
-                if let parent = leafs[parentHash] {
-                    if !parent.hasLink(leaf.hash) {
-                        parent.addLink(leaf.hash)
-                        parentsToUpdate.insert(parentHash)
-                    }
+            guard let parentHash = packet.relationships[leaf.hash] else { continue }
+            if parentHash.isEmpty {
+                root = leaf.hash
+            } else if let parent = leafs[parentHash] {
+                if !parent.hasLink(leaf.hash) {
+                    parent.addLink(leaf.hash)
                 }
             }
         }

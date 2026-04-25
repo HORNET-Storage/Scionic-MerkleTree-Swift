@@ -93,7 +93,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/HORNET-Storage/ScionicMerkleTreeSwift.git", from: "1.0.0"),
+    .package(url: "https://github.com/HORNET-Storage/ScionicMerkleTreeSwift.git", from: "2.0.0"),
 ]
 ```
 
@@ -186,13 +186,17 @@ Sources/ScionicMerkleTree/
 └── Diff/                 — DAG diffing and patching
 
 Tests/ScionicMerkleTreeTests/
-├── CBORTests             — 31 tests
-├── CIDTests              — 34 tests (varint, base32, base58, CID)
-├── MerkleTreeTests       — 15 tests (build, verify, proofs, 100-leaf)
-├── CrossCompatTests      — 5 tests (Merkle tree roots match Go)
-├── CrossCompatLeafTests  — 5 tests (leaf CIDs match Go)
-├── CrossCompatDagTests   — 1 test (full DAG + verify + recreate)
-└── CrossCompatDeepTests  — 1 test (7 files, 4 subdirs, 3 levels)
+├── CBORTests             — CBOR encoding/decoding determinism
+├── CIDTests              — varint, base32, base58, CID generation
+├── MerkleTreeTests       — Classic Merkle Tree build/verify/proof behavior
+├── TreeContentTests      — Go tree wrapper parity for build and verify helpers
+├── AuditTests            — clone, serialization, store, transmission, diff, partial flows
+├── FixtureTests          — standard fixture coverage across DAG operations
+├── TransmissionTests     — batched transmission apply/verify regressions
+├── CrossCompatTests      — Merkle tree roots/proofs match Go
+├── CrossCompatLeafTests  — leaf CIDs match Go
+├── CrossCompatDagTests   — full DAG root/verify/recreate match Go
+└── CrossCompatDeepTests  — deep directory compatibility pipeline
 ```
 
 ## Dependencies
@@ -205,14 +209,12 @@ Tests/ScionicMerkleTreeTests/
 
 ## What Remains
 
-The port covers all core functionality. A few secondary items remain:
+The port covers all core functionality, including packet serialization, fixture coverage, TreeContent wrapper parity, public transmission replay, diff apply, and partial DAG verification. A few secondary items remain:
 
 | Item | Priority | Description |
 |------|----------|-------------|
-| TransmissionPacket JSON/CBOR serialization | Medium | Serialize individual/batched packets for network transport |
-| Test parity with Go | Medium | Go has 15 test files; Swift has 8. Edge cases, serialize round-trip, transmission sim |
-| Test fixture system | Low | Go has `testutil/fixtures.go` with 8 pre-built fixtures |
-| Streaming verification | Low | Go’s DagStore has `VerifyStreaming` without loading full DAG |
+| Broader Go parity sweep | Low | Continue comparing less-central Go edge-case files as new APIs are ported |
+| Streaming verification | Low | Go’s DagStore has `VerifyStreaming` without loading the full DAG |
 
 ## How Compatibility Works
 

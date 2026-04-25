@@ -210,7 +210,7 @@ private func processFile(
         // Multiple chunks — process as child leaves
         if chunkCount == 2, let firstChunk = singleChunk {
             // Process the first chunk we stored earlier
-            let chunkEntryPath = (relPath as NSString).appendingPathComponent("0")
+            let chunkEntryPath = chunkItemName(relPath: relPath, index: 0)
             let chunkBuilder = DagLeafBuilder(name: chunkEntryPath)
             chunkBuilder.setType(.chunk)
             chunkBuilder.setData(firstChunk)
@@ -222,7 +222,7 @@ private func processFile(
         }
 
         // Process current chunk
-        let chunkEntryPath = (relPath as NSString).appendingPathComponent("\(index)")
+        let chunkEntryPath = chunkItemName(relPath: relPath, index: index)
         let chunkBuilder = DagLeafBuilder(name: chunkEntryPath)
         chunkBuilder.setType(.chunk)
         chunkBuilder.setData(chunk)
@@ -294,6 +294,14 @@ private func relativePath(from base: String, to target: String) -> String {
     return relativeParts.joined(separator: "/")
 }
 
+private func chunkItemName(relPath: String, index: Int) -> String {
+#if os(Windows)
+    return "\(relPath)\\\(index)"
+#else
+    return (relPath as NSString).appendingPathComponent("\(index)")
+#endif
+}
+
 // MARK: - Parallel DAG Creation
 
 private func createDagParallel(path: String, additionalData: [String: String]?, processor: LeafProcessor?, config: DagBuilderConfig) throws -> Dag {
@@ -339,6 +347,41 @@ private func createDagParallel(path: String, additionalData: [String: String]?, 
 private struct ParallelEntryResult {
     let leaf: DagLeaf
     let index: Int
+}
+
+private final class ParallelDirectoryState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [ParallelEntryResult] = []
+    private var firstError: Error?
+
+    func shouldStop() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return firstError != nil
+    }
+
+    func append(_ result: ParallelEntryResult) {
+        lock.lock()
+        defer { lock.unlock() }
+        results.append(result)
+    }
+
+    func record(_ error: Error) {
+        lock.lock()
+        defer { lock.unlock() }
+        if firstError == nil {
+            firstError = error
+        }
+    }
+
+    func resultSnapshot() throws -> [ParallelEntryResult] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let error = firstError {
+            throw error
+        }
+        return results
+    }
 }
 
 private func processDirectoryParallel(
@@ -399,9 +442,7 @@ private func processDirectoryParallel(
 
     // Process entries in parallel using DispatchQueue
     let group = DispatchGroup()
-    let resultsLock = NSLock()
-    var results: [ParallelEntryResult] = []
-    var firstError: Error? = nil
+    let state = ParallelDirectoryState()
     let semaphore = DispatchSemaphore(value: maxWorkers)
 
     for (i, childName) in entries.enumerated() {
@@ -422,11 +463,7 @@ private func processDirectoryParallel(
                 group.leave()
             }
 
-            // Check if we already have an error
-            resultsLock.lock()
-            let hasError = firstError != nil
-            resultsLock.unlock()
-            if hasError { return }
+            if state.shouldStop() { return }
 
             do {
                 let childLeaf: DagLeaf
@@ -443,25 +480,16 @@ private func processDirectoryParallel(
                 }
 
                 dag.addLeafSafe(childLeaf, parent: nil)
-
-                resultsLock.lock()
-                results.append(ParallelEntryResult(leaf: childLeaf, index: index))
-                resultsLock.unlock()
+                state.append(ParallelEntryResult(leaf: childLeaf, index: index))
             } catch {
-                resultsLock.lock()
-                if firstError == nil { firstError = error }
-                resultsLock.unlock()
+                state.record(error)
             }
         }
     }
 
     group.wait()
 
-    if let error = firstError {
-        throw error
-    }
-
-    // Sort results by original index to maintain determinism
+    var results = try state.resultSnapshot()
     results.sort { $0.index < $1.index }
 
     for result in results {

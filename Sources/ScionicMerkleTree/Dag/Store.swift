@@ -156,6 +156,14 @@ public class DagStore {
         return try leafStore.hasLeaf(hash)
     }
 
+    public func deleteLeaf(_ hash: String) throws {
+        try leafStore.deleteLeaf(hash)
+        if hash == root {
+            root = ""
+            leafCount = 0
+        }
+    }
+
     public func storeLeaf(_ leaf: DagLeaf) throws {
         try leafStore.storeLeaf(leaf)
         if separateContent, let content = leaf.content, let cs = contentStore {
@@ -190,6 +198,190 @@ public class DagStore {
         try d.verify()
     }
 
+    /// Verifies DAG integrity through the storage-backed API.
+    public func verifyStreaming() throws {
+        guard !root.isEmpty else {
+            throw DagError.brokenDag("no root set")
+        }
+
+        if try isPartialStreaming() {
+            try verifyWithProofsStreaming()
+        } else {
+            try verifyFullDagStreaming()
+        }
+    }
+
+    private func isPartialStreaming() throws -> Bool {
+        guard let rootLeaf = try retrieveLeafWithoutContent(root) else { return true }
+        if let counter = leafStore as? LeafCounter {
+            return counter.count() < rootLeaf.leafCount
+        }
+        for childHash in rootLeaf.links {
+            if try !leafStore.hasLeaf(childHash) { return true }
+        }
+        return false
+    }
+
+    private func verifyFullDagStreaming() throws {
+        guard let rootLeaf = try retrieveLeafWithoutContent(root) else {
+            throw DagError.childMissing(root)
+        }
+        let d = try toDag()
+        try rootLeaf.verifyRootLeaf(dag: d)
+        if rootLeaf.links.count == rootLeaf.currentLinkCount && rootLeaf.currentLinkCount > 0 {
+            try verifyChildrenAgainstMerkleRootStreaming(rootLeaf)
+        }
+        var visited: Set<String> = [root]
+        try verifyChildrenFullDagStreaming(parent: rootLeaf, visited: &visited)
+    }
+
+    private func verifyChildrenFullDagStreaming(parent: DagLeaf, visited: inout Set<String>) throws {
+        if parent.currentLinkCount > 0 && parent.links.count == parent.currentLinkCount {
+            try verifyChildrenAgainstMerkleRootStreaming(parent)
+        }
+
+        for childHash in parent.links {
+            if visited.contains(childHash) { continue }
+            visited.insert(childHash)
+            guard let childLeaf = try retrieveLeafWithoutContent(childHash) else {
+                throw DagError.childMissing(childHash)
+            }
+            try childLeaf.verifyLeaf()
+            guard parent.hasLink(childHash) else {
+                throw DagError.brokenDag("parent \(parent.hash) does not contain link to child \(childHash)")
+            }
+            try verifyChildrenFullDagStreaming(parent: childLeaf, visited: &visited)
+        }
+    }
+
+    private func verifyWithProofsStreaming() throws {
+        guard let rootLeaf = try retrieveLeafWithoutContent(root) else {
+            throw DagError.childMissing(root)
+        }
+        let d = try toDag()
+        try rootLeaf.verifyRootLeaf(dag: d)
+
+        if rootLeaf.currentLinkCount > 0 {
+            var childrenInDag = 0
+            for childHash in rootLeaf.links {
+                if try hasLeaf(childHash) { childrenInDag += 1 }
+            }
+
+            if childrenInDag == rootLeaf.currentLinkCount && rootLeaf.links.count == rootLeaf.currentLinkCount {
+                try verifyChildrenAgainstMerkleRootStreaming(rootLeaf)
+            } else if rootLeaf.currentLinkCount == 1 {
+                if childrenInDag > 0, let childHash = rootLeaf.links.first,
+                   rootLeaf.classicMerkleRoot != Data(childHash.utf8) {
+                    throw DagError.brokenDag("single child verification failed: ClassicMerkleRoot does not match child hash")
+                }
+            } else if rootLeaf.proofs.isEmpty && childrenInDag < rootLeaf.currentLinkCount {
+                throw DagError.brokenDag("root has \(rootLeaf.currentLinkCount) links but only \(childrenInDag) children exist in DAG (no proofs available)")
+            }
+        }
+
+        let leafHashes = try collectAllLeafHashesForPartialDag()
+        for leafHash in leafHashes where leafHash != root {
+            guard let leaf = try retrieveLeafWithoutContent(leafHash) else { continue }
+            try leaf.verifyLeaf()
+            try verifyPathToRootStreaming(leaf)
+        }
+    }
+
+    private func verifyPathToRootStreaming(_ leaf: DagLeaf) throws {
+        var current = leaf
+        while current.hash != root {
+            guard let parent = try findParentStreaming(childHash: current.hash) else {
+                throw DagError.brokenDag("broken path to root for leaf \(leaf.hash)")
+            }
+            if parent.hash != root {
+                try parent.verifyLeaf()
+            }
+
+            let hasAllChildren = parent.links.count == parent.currentLinkCount
+            if hasAllChildren && parent.currentLinkCount > 0 {
+                var childrenInDag = 0
+                for childHash in parent.links {
+                    if try hasLeaf(childHash) { childrenInDag += 1 }
+                }
+                if childrenInDag == parent.currentLinkCount {
+                    try verifyChildrenAgainstMerkleRootStreaming(parent)
+                } else {
+                    try verifyWithProofStreaming(parent: parent, childHash: current.hash)
+                }
+            } else if parent.currentLinkCount > 1 {
+                try verifyWithProofStreaming(parent: parent, childHash: current.hash)
+            }
+
+            current = parent
+        }
+    }
+
+    private func verifyWithProofStreaming(parent: DagLeaf, childHash: String) throws {
+        guard let proof = parent.proofs[childHash] else {
+            throw DagError.brokenDag("missing merkle proof for node \(childHash) in partial DAG")
+        }
+        try parent.verifyBranch(proof)
+    }
+
+    private func findParentStreaming(childHash: String) throws -> DagLeaf? {
+        let leafHashes = try collectAllLeafHashesForPartialDag()
+        for hash in leafHashes {
+            guard let leaf = try retrieveLeafWithoutContent(hash) else { continue }
+            if leaf.hasLink(childHash) { return leaf }
+        }
+        return nil
+    }
+
+    private func collectAllLeafHashesForPartialDag() throws -> [String] {
+        if let enumerator = leafStore as? LeafEnumerator {
+            return enumerator.getAllLeafHashes()
+        }
+        return try collectExistingLeafHashesFromRoot()
+    }
+
+    private func collectExistingLeafHashesFromRoot() throws -> [String] {
+        guard !root.isEmpty else {
+            throw DagError.brokenDag("no root set")
+        }
+        var visited = Set<String>()
+        var hashes: [String] = []
+
+        func collect(_ hash: String) throws {
+            guard !visited.contains(hash) else { return }
+            guard try leafStore.hasLeaf(hash) else { return }
+            visited.insert(hash)
+            hashes.append(hash)
+            guard let leaf = try retrieveLeafWithoutContent(hash) else { return }
+            for childHash in leaf.links {
+                try collect(childHash)
+            }
+        }
+
+        try collect(root)
+        return hashes
+    }
+
+    private func verifyChildrenAgainstMerkleRootStreaming(_ parent: DagLeaf) throws {
+        if parent.currentLinkCount == 0 { return }
+
+        if parent.currentLinkCount == 1 {
+            if let childHash = parent.links.first,
+               parent.classicMerkleRoot != Data(childHash.utf8) {
+                throw DagError.brokenDag("single child merkle root mismatch")
+            }
+            return
+        }
+
+        let builder = TreeContent()
+        for linkHash in parent.links {
+            builder.addLeaf(key: linkHash, data: linkHash)
+        }
+        let (tree, _) = try builder.build()
+        if tree.root != parent.classicMerkleRoot {
+            throw DagError.brokenDag("merkle root mismatch for parent \(parent.hash)")
+        }
+    }
+
     /// Verifies a single leaf by hash.
     public func verifyLeaf(_ hash: String) throws {
         guard let leaf = try retrieveLeafWithoutContent(hash) else {
@@ -200,6 +392,33 @@ public class DagStore {
             try leaf.verifyRootLeaf(dag: d)
         } else {
             try leaf.verifyLeaf()
+        }
+    }
+
+    /// Verifies a child leaf and its relationship to a parent leaf.
+    public func verifyLeafWithParent(_ leafHash: String, parentHash: String, proof: ClassicTreeBranch? = nil) throws {
+        guard let leaf = try retrieveLeafWithoutContent(leafHash) else {
+            throw DagError.childMissing(leafHash)
+        }
+        guard let parent = try retrieveLeafWithoutContent(parentHash) else {
+            throw DagError.childMissing(parentHash)
+        }
+        guard parent.hasLink(leafHash) else {
+            throw DagError.brokenDag("parent \(parentHash) does not link to child \(leafHash)")
+        }
+
+        if leafHash == root {
+            let d = try toDag()
+            try leaf.verifyRootLeaf(dag: d)
+        } else {
+            try leaf.verifyLeaf()
+        }
+
+        if parent.currentLinkCount > 1 {
+            guard let proof = proof else {
+                throw DagError.brokenDag("proof required for child \(leafHash) under parent \(parentHash)")
+            }
+            try parent.verifyBranch(proof)
         }
     }
 
@@ -242,12 +461,81 @@ public class DagStore {
         return content
     }
 
+    /// Gets full content through metadata-first store access.
+    public func getContentFromLeafStreaming(_ hash: String) throws -> Data {
+        guard let leaf = try retrieveLeafWithoutContent(hash) else {
+            throw DagError.childMissing(hash)
+        }
+
+        if leaf.links.isEmpty {
+            return try retrieveLeaf(hash)?.content ?? Data()
+        }
+
+        struct ChunkInfo {
+            let hash: String
+            let itemName: String
+        }
+
+        var chunks: [ChunkInfo] = []
+        for link in leaf.links {
+            guard let child = try retrieveLeafWithoutContent(link) else {
+                throw DagError.childMissing(link)
+            }
+            chunks.append(ChunkInfo(hash: link, itemName: child.itemName))
+        }
+
+        chunks.sort { a, b in
+            let baseA = (a.itemName as NSString).lastPathComponent
+            let baseB = (b.itemName as NSString).lastPathComponent
+            if let numA = Int(baseA), let numB = Int(baseB) { return numA < numB }
+            return a.itemName < b.itemName
+        }
+
+        var content = Data()
+        for chunk in chunks {
+            guard let child = try retrieveLeaf(chunk.hash) else {
+                throw DagError.childMissing(chunk.hash)
+            }
+            content.append(child.content ?? Data())
+        }
+        return content
+    }
+
     // MARK: - Directory Recreation
 
     /// Recreates directory structure from the store.
     public func createDirectory(path: String) throws {
         let d = try toDag()
         try d.createDirectory(path: path)
+    }
+
+    /// Recreates directory structure using storage-backed traversal.
+    public func createDirectoryStreaming(path: String) throws {
+        guard let rootLeaf = try retrieveLeafWithoutContent(root) else {
+            throw DagError.childMissing(root)
+        }
+        try createDirectoryLeafStreaming(rootLeaf, path: path)
+    }
+
+    private func createDirectoryLeafStreaming(_ leaf: DagLeaf, path: String) throws {
+        switch leaf.type {
+        case .directory:
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+            for childHash in leaf.links {
+                guard let child = try retrieveLeafWithoutContent(childHash) else {
+                    throw DagError.childMissing(childHash)
+                }
+                let childPath = (path as NSString).appendingPathComponent(child.itemName)
+                try createDirectoryLeafStreaming(child, path: childPath)
+            }
+        case .file:
+            let content = try getContentFromLeafStreaming(leaf.hash)
+            let parentPath = (path as NSString).deletingLastPathComponent
+            try FileManager.default.createDirectory(atPath: parentPath, withIntermediateDirectories: true)
+            try content.write(to: URL(fileURLWithPath: path))
+        case .chunk:
+            throw DagError.brokenDag("unexpected chunk leaf at path: \(path)")
+        }
     }
 
     // MARK: - Serialization
@@ -305,6 +593,30 @@ public class DagStore {
         }
     }
 
+    /// Adds a batched transmission packet to the store.
+    public func addBatchedTransmissionPacket(_ packet: BatchedTransmissionPacket?) throws {
+        guard let packet, !packet.leaves.isEmpty else { return }
+
+        var verifiedLeaves: [DagLeaf] = []
+        for leaf in packet.leaves {
+            let parentHash = packet.relationships[leaf.hash] ?? ""
+            if parentHash.isEmpty && root.isEmpty {
+                let tempDag = Dag(root: leaf.hash, leafs: [leaf.hash: leaf])
+                try leaf.verifyRootLeaf(dag: tempDag)
+                root = leaf.hash
+                leafCount = leaf.leafCount
+            } else if !parentHash.isEmpty {
+                try leaf.verifyLeaf()
+                if let parent = try retrieveLeafWithoutContent(parentHash), !parent.hasLink(leaf.hash) {
+                    throw DagError.brokenDag("parent \(parentHash) does not link to child \(leaf.hash)")
+                }
+            }
+            verifiedLeaves.append(leaf)
+        }
+
+        try storeLeavesInBatches(verifiedLeaves)
+    }
+
     /// Gets transmission packets (delegates to Dag).
     public func getLeafSequence() throws -> [TransmissionPacket] {
         let d = try toDag()
@@ -317,6 +629,42 @@ public class DagStore {
     public func getPartial(leafHashes: [String], pruneLinks: Bool) throws -> Dag {
         let d = try toDag()
         return try d.getPartial(leafHashes: leafHashes, pruneLinks: pruneLinks)
+    }
+
+    public func iterateDagStreaming(_ processLeaf: (DagLeaf, DagLeaf?) throws -> Void) throws {
+        guard !root.isEmpty else { return }
+        var visited = Set<String>()
+
+        func visit(_ hash: String, parent: DagLeaf?) throws {
+            guard !visited.contains(hash) else { return }
+            guard let leaf = try retrieveLeafWithoutContent(hash) else {
+                throw DagError.childMissing(hash)
+            }
+            visited.insert(hash)
+            try processLeaf(leaf, parent)
+            for childHash in leaf.links {
+                try visit(childHash, parent: leaf)
+            }
+        }
+
+        try visit(root, parent: nil)
+    }
+
+    public func countLeavesStreaming() throws -> Int {
+        if root.isEmpty { return 0 }
+        if let counter = leafStore as? LeafCounter {
+            return counter.count()
+        }
+        if leafCount > 0 { return leafCount }
+        if let rootLeaf = try retrieveLeafWithoutContent(root), rootLeaf.leafCount > 0 {
+            return rootLeaf.leafCount
+        }
+
+        var count = 0
+        try iterateDagStreaming { _, _ in
+            count += 1
+        }
+        return count
     }
 
     // MARK: - Labels

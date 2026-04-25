@@ -1,18 +1,8 @@
-// ScionicMerkleTreeTests.swift — Test suite for the Swift Scionic Merkle Tree port
+// ScionicMerkleTreeTests.swift — Smoke tests for the Swift Scionic Merkle Tree port
 //
-// Test files will mirror the Go test suite:
-//   - CBORTests.swift          — CBOR encoding determinism
-//   - CIDTests.swift           — CID generation + round-trip
-//   - MerkleTreeTests.swift    — Classic Merkle Tree build/verify/proof
-//   - DagTests.swift           — DAG creation, verify, directory recreation
-//   - SerializationTests.swift — CBOR + JSON round-trip
-//   - TransmissionTests.swift  — LeafSync packets
-//   - PartialTests.swift       — Partial DAG extraction + verification
-//   - DiffTests.swift          — DAG diffing + patching
-//   - ParallelTests.swift      — Parallel creation matches sequential
-//   - CrossCompatTests.swift   — Go CBOR/JSON -> Swift import (hash compat)
-//
-// TODO: Implement in Task #14
+// The full suite lives in focused files covering CBOR/CID primitives, Classic Merkle
+// Trees, TreeContent wrappers, DAG fixtures, transmission, diff/partial flows,
+// and Go cross-compatibility vectors.
 
 import XCTest
 @testable import ScionicMerkleTree
