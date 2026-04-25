@@ -1,4 +1,4 @@
-# ScionicMerkleTree (Swift)
+# Scionic Merkle Trees (Swift)
 
 A comprehensive Swift port of [Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) — a hybrid Merkle DAG / Merkle Tree data structure that combines the folder support of IPFS Merkle DAGs with the small branches of Classic Merkle Trees.
 
