@@ -22,7 +22,11 @@ extension Dag {
 
     /// Verifies a full DAG by iterating all leaves and checking parent-child relationships.
     private func verifyFullDag() throws {
+        var visited = Set<String>()
+
         try iterateDag { leaf, parent in
+            visited.insert(leaf.hash)
+
             if leaf.hash == self.root {
                 try leaf.verifyRootLeaf(dag: self)
                 // Verify root's children against merkle root if we have all children
@@ -44,6 +48,10 @@ extension Dag {
                     try parent.verifyChildrenAgainstMerkleRoot(dag: self)
                 }
             }
+        }
+
+        if visited.count != leafs.count {
+            throw DagError.brokenDag("dag contains \(leafs.count - visited.count) unreachable leaves")
         }
     }
 
@@ -109,7 +117,11 @@ extension Dag {
                     if childrenInDag == parent.currentLinkCount {
                         try parent.verifyChildrenAgainstMerkleRoot(dag: self)
                     } else if let proof = parent.proofs[current.hash] {
-                        try parent.verifyBranch(proof)
+                        do {
+                            try parent.verifyBranch(proof)
+                        } catch {
+                            throw DagError.brokenDag("invalid merkle proof for node \(current.hash): \(error)")
+                        }
                     } else if parent.currentLinkCount > 1 {
                         throw DagError.brokenDag("missing merkle proof for \(current.hash) in partial DAG")
                     }
@@ -117,7 +129,11 @@ extension Dag {
                     guard let proof = parent.proofs[current.hash] else {
                         throw DagError.brokenDag("missing merkle proof for \(current.hash)")
                     }
-                    try parent.verifyBranch(proof)
+                    do {
+                        try parent.verifyBranch(proof)
+                    } catch {
+                        throw DagError.brokenDag("invalid merkle proof for node \(current.hash): \(error)")
+                    }
                 }
 
                 current = parent

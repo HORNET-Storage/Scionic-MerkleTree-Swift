@@ -230,6 +230,13 @@ extension DagLeaf {
     ///
     /// Mirrors Go's `VerifyLeaf`. Re-serializes the same CBOR struct and checks the CID matches.
     public func verifyLeaf() throws {
+        if let content, let contentHash, !contentHash.isEmpty {
+            let computedHash = Data(SHA256.hash(data: content))
+            guard computedHash == contentHash else {
+                throw DagError.brokenDag("content hash mismatch")
+            }
+        }
+
         let sortedAD = sortMapByKeys(additionalData)
         let sortedKV = sortMapForVerification(sortedAD)
 
@@ -268,6 +275,13 @@ extension DagLeaf {
     /// Mirrors Go's `VerifyRootLeaf`. Includes LeafCount, ContentSize, DagSize in the hash.
     /// Also validates ContentSize and DagSize by recalculating from children when a full DAG is provided.
     public func verifyRootLeaf(dag: Dag? = nil) throws {
+        if let content, let contentHash, !contentHash.isEmpty {
+            let computedHash = Data(SHA256.hash(data: content))
+            guard computedHash == contentHash else {
+                throw DagError.brokenDag("content hash mismatch")
+            }
+        }
+
         let sortedAD = sortMapByKeys(additionalData)
         let sortedKV = sortMapForVerification(sortedAD)
 

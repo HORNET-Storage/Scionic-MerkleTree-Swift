@@ -61,7 +61,7 @@ extension Dag {
             sLeaf.type = leaf.type.rawValue
             sLeaf.contentHash = leaf.contentHash
             sLeaf.content = leaf.content
-            sLeaf.classicMerkleRoot = leaf.classicMerkleRoot.isEmpty ? nil : leaf.classicMerkleRoot
+            sLeaf.classicMerkleRoot = leaf.classicMerkleRoot
             sLeaf.currentLinkCount = leaf.currentLinkCount
             sLeaf.leafCount = leaf.leafCount
             sLeaf.contentSize = leaf.contentSize
@@ -190,7 +190,7 @@ extension Dag {
         let serializable = toSerializable()
 
         var leafPairs: [(String, CBORValue)] = []
-        for (hash, sLeaf) in serializable.leafs {
+        for (hash, sLeaf) in serializable.leafs.sorted(by: { $0.key < $1.key }) {
             leafPairs.append((hash, serializableDagLeafToCBOR(sLeaf)))
         }
 
@@ -241,18 +241,18 @@ func serializableDagLeafToCBOR(_ sLeaf: SerializableDagLeaf) -> CBORValue {
         ("Type", .textString(sLeaf.type)),
         ("ContentHash", .optionalBytes(sLeaf.contentHash)),
         ("Content", .optionalBytes(sLeaf.content)),
-        ("ClassicMerkleRoot", .optionalBytes(sLeaf.classicMerkleRoot)),
+        ("ClassicMerkleRoot", .byteString(sLeaf.classicMerkleRoot ?? Data())),
         ("CurrentLinkCount", .int(sLeaf.currentLinkCount)),
         ("LeafCount", .int(sLeaf.leafCount)),
         ("ContentSize", .int64(sLeaf.contentSize)),
         ("DagSize", .int64(sLeaf.dagSize)),
-        ("Links", sLeaf.links.isEmpty ? .null : .array(sLeaf.links.map { .textString($0) })),
+        ("Links", .array(sLeaf.links.map { .textString($0) })),
         ("AdditionalData", encodeSortedMapToCBOR(sLeaf.additionalData)),
     ]
 
     if let sp = sLeaf.storedProofs, !sp.isEmpty {
         var proofPairs: [(String, CBORValue)] = []
-        for (k, v) in sp {
+        for (k, v) in sp.sorted(by: { $0.key < $1.key }) {
             proofPairs.append((k, serializableProofToCBOR(v)))
         }
         pairs.append(("stored_proofs", .map(CBOROrderedMap(proofPairs))))
@@ -390,17 +390,17 @@ extension TransmissionPacket {
     public func toCBOR() -> Data {
         let s = toSerializable()
         let cborEncoder = CBOREncoder()
-        var proofPairs: [(String, CBORValue)] = []
-        if let sp = s.proofs {
-            for (k, v) in sp {
-                proofPairs.append((k, serializableProofToCBOR(v)))
-            }
-        }
-        return cborEncoder.encodeMap([
+        var pairs: [(String, CBORValue)] = [
             ("Leaf", serializableDagLeafToCBOR(s.leaf)),
             ("ParentHash", .textString(s.parentHash)),
-            ("proofs", proofPairs.isEmpty ? .null : .map(CBOROrderedMap(proofPairs))),
-        ])
+        ]
+        if let sp = s.proofs, !sp.isEmpty {
+            let proofPairs = sp
+                .sorted(by: { $0.key < $1.key })
+                .map { ($0.key, serializableProofToCBOR($0.value)) }
+            pairs.append(("proofs", .map(CBOROrderedMap(proofPairs))))
+        }
+        return cborEncoder.encodeMap(pairs)
     }
 
     public static func fromJSON(_ data: Data) throws -> TransmissionPacket {
@@ -501,7 +501,7 @@ func dagLeafToSerializable(_ leaf: DagLeaf) -> SerializableDagLeaf {
     s.type = leaf.type.rawValue
     s.contentHash = leaf.contentHash
     s.content = leaf.content
-    s.classicMerkleRoot = leaf.classicMerkleRoot.isEmpty ? nil : leaf.classicMerkleRoot
+    s.classicMerkleRoot = leaf.classicMerkleRoot
     s.currentLinkCount = leaf.currentLinkCount
     s.leafCount = leaf.leafCount
     s.contentSize = leaf.contentSize

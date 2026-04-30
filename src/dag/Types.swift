@@ -88,7 +88,7 @@ public class Dag {
 
     /// Returns true if this DAG has fewer leaves than the root's LeafCount indicates.
     public func isPartial() -> Bool {
-        guard let rootLeaf = leafs[root] else { return false }
+        guard let rootLeaf = leafs[root] else { return true }
         if rootLeaf.leafCount == 0 { return false }
         return leafs.count < rootLeaf.leafCount
     }
