@@ -316,6 +316,9 @@ extension Dag {
             batchLeaves[leaf.hash] = leaf
         }
 
+        // Verify each complete parent's Merkle root exactly once.
+        var verifiedParents = Set<String>()
+
         for childLeaf in packet.leaves {
             guard let parentHash = packet.relationships[childLeaf.hash] else {
                 throw DagError.brokenDag("missing relationship for leaf \(childLeaf.hash)")
@@ -331,7 +334,17 @@ extension Dag {
                 // Find parent (in batch or in existing DAG)
                 let parentLeaf = batchLeaves[parentHash] ?? leafs[parentHash]
                 if let parentLeaf = parentLeaf, parentLeaf.currentLinkCount > 1 {
-                    if parentLeaf.proofs.isEmpty { continue }
+                    if parentLeaf.proofs.isEmpty {
+                        // No proofs => all children are in this batch with the
+                        // parent. Verify the parent's Merkle root against its full
+                        // child set now (once) so a forged child is rejected here,
+                        // not only by a later verify().
+                        if !verifiedParents.contains(parentHash) {
+                            try parentLeaf.verifyChildrenAgainstMerkleRoot(dag: self)
+                            verifiedParents.insert(parentHash)
+                        }
+                        continue
+                    }
                     guard let proof = parentLeaf.proofs[childLeaf.hash] else {
                         if batchLeaves[parentHash] != nil { continue }
                         throw DagError.brokenDag("missing proof for \(childLeaf.hash)")

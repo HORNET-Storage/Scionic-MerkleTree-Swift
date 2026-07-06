@@ -491,7 +491,7 @@ extension DagLeaf {
                 guard let childLeaf = dag.leafs[link] else {
                     throw DagError.invalidLink(link)
                 }
-                let childPath = (path as NSString).appendingPathComponent(childLeaf.itemName)
+                let childPath = try safeJoin(path, childLeaf.itemName)
                 try childLeaf.createDirectoryLeaf(path: childPath, dag: dag)
             }
 

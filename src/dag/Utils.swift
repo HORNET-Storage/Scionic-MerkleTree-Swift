@@ -3,6 +3,7 @@
 // Ported from dag/utils.go.
 
 import Foundation
+import Crypto
 
 // MARK: - KeyValue (for CBOR serialization)
 
@@ -120,4 +121,36 @@ public func calculateTotalDagSize(_ dag: Dag) throws -> Int64 {
     }
 
     return totalSize
+}
+
+// MARK: - Path Safety
+
+/// Joins a base directory with a single-component child name, rejecting names
+/// that contain path separators, are "."/"..", or are absolute. Prevents a
+/// malicious DAG's itemName (e.g. "../../etc/passwd") from escaping the target
+/// directory when a downloaded DAG is reconstructed to disk. Mirrors Go's safeJoin.
+func safeJoin(_ base: String, _ name: String) throws -> String {
+    if name.isEmpty || name == "." || name == ".."
+        || name.contains("/") || name.contains("\\")
+        || (name as NSString).isAbsolutePath {
+        throw DagError.brokenDag("unsafe item name \"\(name)\" for path reconstruction")
+    }
+    return (base as NSString).appendingPathComponent(name)
+}
+
+// MARK: - Content Hash Verification
+
+/// Verifies a leaf's content against its committed ContentHash when content is
+/// present. Streaming verification loads leaves without content, so this check
+/// must run whenever content is loaded on a reconstruction/read path.
+/// Mirrors Go's verifyLeafContentHash.
+func verifyLeafContentHash(_ leaf: DagLeaf) throws {
+    guard let content = leaf.content else { return }
+    guard let contentHash = leaf.contentHash, !contentHash.isEmpty else {
+        throw DagError.brokenDag("leaf \(leaf.hash) has content but no content hash to verify against")
+    }
+    let computed = Data(SHA256.hash(data: content))
+    guard computed == contentHash else {
+        throw DagError.brokenDag("leaf \(leaf.hash) content does not match its content hash")
+    }
 }

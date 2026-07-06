@@ -373,10 +373,10 @@ public class DagStore {
         if let counter = leafStore as? LeafCounter {
             return counter.count() < rootLeaf.leafCount
         }
-        for childHash in rootLeaf.links {
-            if try !leafStore.hasLeaf(childHash) { return true }
-        }
-        return false
+        // Count every existing leaf reachable from root; fewer than the root's
+        // leafCount means the DAG is partial.
+        let hashes = try collectExistingLeafHashesFromRoot()
+        return hashes.count < rootLeaf.leafCount
     }
 
     private func verifyFullDagStreaming() throws {
@@ -621,7 +621,9 @@ public class DagStore {
         }
 
         if leaf.links.isEmpty {
-            return try retrieveLeaf(hash)?.content ?? Data()
+            let full = try retrieveLeaf(hash)
+            if let full { try verifyLeafContentHash(full) }
+            return full?.content ?? Data()
         }
 
         struct ChunkInfo {
@@ -649,6 +651,7 @@ public class DagStore {
             guard let child = try retrieveLeaf(chunk.hash) else {
                 throw DagError.childMissing(chunk.hash)
             }
+            try verifyLeafContentHash(child)
             content.append(child.content ?? Data())
         }
         return content
@@ -678,7 +681,7 @@ public class DagStore {
                 guard let child = try retrieveLeafWithoutContent(childHash) else {
                     throw DagError.childMissing(childHash)
                 }
-                let childPath = (path as NSString).appendingPathComponent(child.itemName)
+                let childPath = try safeJoin(path, child.itemName)
                 try createDirectoryLeafStreaming(child, path: childPath)
             }
         case .file:

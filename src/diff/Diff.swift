@@ -171,9 +171,20 @@ public func diffFromNewLeaves(originalDag: Dag, newLeaves: [String: DagLeaf]) ->
     var newLeafsMap: [String: DagLeaf] = [:]
     for (hash, leaf) in newLeaves {
         newLeafsMap[hash] = leaf
+        // Only the root leaf has a LeafCount (>= 1). Pick deterministically (by
+        // highest LeafCount, then smallest hash) so map iteration order can't
+        // produce a nondeterministic root.
         if leaf.leafCount > 0 {
-            newRoot = leaf
-            newRootHash = hash
+            if let currentRoot = newRoot {
+                if leaf.leafCount > currentRoot.leafCount
+                    || (leaf.leafCount == currentRoot.leafCount && hash < newRootHash) {
+                    newRoot = leaf
+                    newRootHash = hash
+                }
+            } else {
+                newRoot = leaf
+                newRootHash = hash
+            }
         }
     }
 

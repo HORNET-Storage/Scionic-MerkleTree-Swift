@@ -446,11 +446,14 @@ extension MerkleTree {
     /// Retrieves the index for the given key in the sorted key array.
     /// Mirrors Go's `GetIndexForKey`.
     public func getIndexForKey(_ key: String) -> (index: Int, exists: Bool) {
-        for (index, storedKey) in keys.enumerated() {
-            if storedKey == key {
-                return (index, true)
-            }
+        // keys is sorted during construction, so binary search.
+        var lo = 0
+        var hi = keys.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if keys[mid] < key { lo = mid + 1 } else { hi = mid }
         }
+        if lo < keys.count && keys[lo] == key { return (lo, true) }
         return (-1, false)
     }
 }
