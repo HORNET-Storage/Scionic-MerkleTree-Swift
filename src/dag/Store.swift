@@ -759,18 +759,29 @@ public class DagStore {
     }
 
     /// Adds a batched transmission packet to the store.
+    ///
+    /// Every leaf must carry an explicit relationship entry. An empty parent is the root
+    /// sentinel and is accepted only while the store has no root (or re-sends the same
+    /// root); a missing entry or a conflicting root claim is rejected, so no leaf can be
+    /// stored without taking a verification branch (missing and empty relationships were
+    /// previously conflated and fell through to storage unverified).
     public func addBatchedTransmissionPacket(_ packet: BatchedTransmissionPacket?) throws {
         guard let packet, !packet.leaves.isEmpty else { return }
 
         var verifiedLeaves: [DagLeaf] = []
         for leaf in packet.leaves {
-            let parentHash = packet.relationships[leaf.hash] ?? ""
-            if parentHash.isEmpty && root.isEmpty {
+            guard let parentHash = packet.relationships[leaf.hash] else {
+                throw DagError.brokenDag("missing relationship for leaf \(leaf.hash)")
+            }
+            if parentHash.isEmpty {
+                guard root.isEmpty || root == leaf.hash else {
+                    throw DagError.brokenDag("unexpected extra root marker for leaf \(leaf.hash)")
+                }
                 try leaf.verifyRootLeaf()
                 leaf.parentHash = ""
                 root = leaf.hash
                 leafCount = leaf.leafCount
-            } else if !parentHash.isEmpty {
+            } else {
                 try leaf.verifyLeaf()
                 leaf.parentHash = parentHash
                 if let parent = try retrieveLeafWithoutContent(parentHash), !parent.hasLink(leaf.hash) {
