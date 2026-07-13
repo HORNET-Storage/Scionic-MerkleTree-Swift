@@ -9,6 +9,9 @@ import XCTest
 
 final class ScionicMerkleTreeTests: XCTestCase {
     func testLibraryVersion() {
-        XCTAssertEqual(version, "2.0.0")
+        // Module-qualified: inside an XCTestCase (an NSObject subclass), the bare
+        // name `version` resolves to the inherited `NSObject.version()` class method,
+        // shadowing the library's top-level constant.
+        XCTAssertEqual(ScionicMerkleTree.version, "2.0.0")
     }
 }
