@@ -71,23 +71,47 @@ final class SpecVectorParityTests: XCTestCase {
         let batches: [Batch]
     }
 
-    private lazy var goRepoRoot: String = {
-        let cwd = FileManager.default.currentDirectoryPath
-        return (cwd as NSString).deletingLastPathComponent + "/scionic-merkletree"
+    /// Root of the sibling Go repo checkout (`scionic-merkletree`) that provides
+    /// `spec/vectors`. Resolved from this file's location (not the runner's cwd),
+    /// so it works under both `swift test` and Xcode. Override with the
+    /// SCIONIC_MERKLETREE_GO_ROOT environment variable when the checkout lives elsewhere.
+    private static let goRepoRoot: String = {
+        if let override = ProcessInfo.processInfo.environment["SCIONIC_MERKLETREE_GO_ROOT"],
+           !override.isEmpty {
+            return override
+        }
+        // #filePath = <swift repo>/tests/tests/SpecVectorParityTests.swift
+        let swiftRepoRoot = (((#filePath as NSString)
+            .deletingLastPathComponent as NSString)
+            .deletingLastPathComponent as NSString)
+            .deletingLastPathComponent
+        return ((swiftRepoRoot as NSString).deletingLastPathComponent as NSString)
+            .appendingPathComponent("scionic-merkletree")
     }()
 
-    private lazy var vectorsRoot: String = {
+    private static let vectorsRoot: String =
         (goRepoRoot as NSString).appendingPathComponent("spec/vectors")
-    }()
 
-    private lazy var manifest: VectorManifest = {
-        let manifestPath = (vectorsRoot as NSString).appendingPathComponent("manifest.json")
-        let data = try! Data(contentsOf: URL(fileURLWithPath: manifestPath))
-        return try! JSONDecoder().decode(VectorManifest.self, from: data)
-    }()
+    /// Loads the spec-vector manifest, or skips the calling test when the sibling
+    /// Go checkout is absent on this machine. Skipping (instead of the previous
+    /// `try!` fatalError) keeps a missing optional dependency from crashing the
+    /// whole xctest process and silently cancelling every suite after this one.
+    /// A present-but-undecodable manifest is a genuine failure and still throws.
+    private func loadedManifest() throws -> VectorManifest {
+        let manifestPath = (Self.vectorsRoot as NSString).appendingPathComponent("manifest.json")
+        guard FileManager.default.fileExists(atPath: manifestPath) else {
+            throw XCTSkip(
+                "Spec vectors not found at \(manifestPath). Clone the Go repo as a sibling " +
+                "directory named 'scionic-merkletree' (or set SCIONIC_MERKLETREE_GO_ROOT) " +
+                "and generate spec/vectors to run the spec parity suite."
+            )
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: manifestPath))
+        return try JSONDecoder().decode(VectorManifest.self, from: data)
+    }
 
     private func vectorPath(_ relativePath: String) -> String {
-        (vectorsRoot as NSString).appendingPathComponent(relativePath)
+        (Self.vectorsRoot as NSString).appendingPathComponent(relativePath)
     }
 
     private func readNegativeMeta(at relativePath: String) throws -> NegativeMeta {
@@ -109,12 +133,12 @@ final class SpecVectorParityTests: XCTestCase {
     }
 
     private func rootInputAbsolutePath(for vectorCase: VectorManifest.VectorCase) -> String {
-        let caseRoot = (vectorsRoot as NSString).appendingPathComponent("cases/\(vectorCase.name)")
+        let caseRoot = (Self.vectorsRoot as NSString).appendingPathComponent("cases/\(vectorCase.name)")
         return (caseRoot as NSString).appendingPathComponent(vectorCase.rootInputPath)
     }
 
     func testManifestFullDagVectorsParseAndVerify() throws {
-        for vectorCase in manifest.cases {
+        for vectorCase in try loadedManifest().cases {
             let dagPath = vectorPath(vectorCase.fullPath + "/dag.cbor")
             let dag = try Dag.readDag(path: dagPath)
 
@@ -129,7 +153,7 @@ final class SpecVectorParityTests: XCTestCase {
     }
 
     func testManifestFullDagCBORRoundTrip() throws {
-        for vectorCase in manifest.cases {
+        for vectorCase in try loadedManifest().cases {
             let dagPath = vectorPath(vectorCase.fullPath + "/dag.cbor")
             let dag = try Dag.readDag(path: dagPath)
             let roundTripped = try Dag.fromCBOR(dag.toCBOR())
@@ -141,6 +165,7 @@ final class SpecVectorParityTests: XCTestCase {
     }
 
     func testManifestInputRootsMatchGoVectors() throws {
+        let manifest = try loadedManifest()
         setChunkSize(4096)
         defer { setDefaultChunkSize() }
 
@@ -159,7 +184,7 @@ final class SpecVectorParityTests: XCTestCase {
     }
 
     func testManifestNegativeVectorsFailVerification() throws {
-        for vectorCase in manifest.cases {
+        for vectorCase in try loadedManifest().cases {
             for negativePath in vectorCase.negativeVectorPaths {
                 let meta = try readNegativeMeta(at: negativePath)
                 let dagPath = vectorPath(negativePath + "/dag.cbor")
@@ -177,7 +202,7 @@ final class SpecVectorParityTests: XCTestCase {
     }
 
     func testManifestPartialVectorsParseAndVerify() throws {
-        for vectorCase in manifest.cases {
+        for vectorCase in try loadedManifest().cases {
             for partialPath in vectorCase.partials {
                 let dagPath = vectorPath(partialPath + "/dag.cbor")
                 let dag = try Dag.readDag(path: dagPath)
@@ -189,7 +214,7 @@ final class SpecVectorParityTests: XCTestCase {
     }
 
     func testManifestTransmissionSequenceCBORParityAndReplay() throws {
-        for vectorCase in manifest.cases {
+        for vectorCase in try loadedManifest().cases {
             let sequence = try readTransmissionSequence(at: vectorCase.transmissionPath)
             let receiver = Dag()
 
@@ -211,7 +236,7 @@ final class SpecVectorParityTests: XCTestCase {
     }
 
     func testManifestBatchedSequenceCBORParityAndReplay() throws {
-        for vectorCase in manifest.cases {
+        for vectorCase in try loadedManifest().cases {
             let sequence = try readBatchedSequence(at: vectorCase.batchedPath)
             let receiver = Dag()
 
