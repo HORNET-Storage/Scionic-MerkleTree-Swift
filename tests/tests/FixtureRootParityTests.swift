@@ -2,6 +2,21 @@ import Foundation
 import XCTest
 @testable import ScionicMerkleTree
 
+// Chunked-file DAG roots are PLATFORM-OF-CREATION dependent, faithfully mirroring
+// Go: chunk leaves are named filepath.Join(relPath, index) (dag/dag.go in
+// HORNET-Storage/Scionic-Merkle-Tree/v2), so identical bytes chunk-join with '\'
+// on Windows and '/' elsewhere and yield different CIDs. Unchunked fixtures are
+// platform-independent because file relPaths are '/'-normalized on every platform.
+// Both pin sets below are authoritative Go v2.2.6 output, regenerated with
+// tools/gofixtureroots on each platform (windows and linux runs verified).
+#if os(Windows)
+private let goSingleLargeFileRoot = "bafireighsz3l24ndzdt4vthraeydfc3ilzajmj56ozbcjav2oablln2zzy"
+private let goMixedSizesRoot = "bafireigsytb3lqy7xxuq53376n4xypeyyn3f6a4hnznxso4r52aeobjpsi"
+#else
+private let goSingleLargeFileRoot = "bafireid6hb33tyj2vjeaviawjjkitpupu2xsyf3u4jziymh3eqlpv66zuq"
+private let goMixedSizesRoot = "bafireihuepywkbxfknipjupyd47yyu7f7nuddndtb4vdai7kinfebi7yhm"
+#endif
+
 final class FixtureRootParityTests: XCTestCase {
     private struct ExpectedFixtureRoot {
         let root: String
@@ -11,6 +26,10 @@ final class FixtureRootParityTests: XCTestCase {
         let dagSize: Int64
     }
 
+    /// Authoritative Go v2.2.6 values from tools/gofixtureroots. Roots for the
+    /// chunked fixtures are per-platform (see the header comment); every other
+    /// field is platform-independent ('\' and '/' have equal byte length, so
+    /// even dagSize matches across platforms).
     private let expectedByFixture: [String: ExpectedFixtureRoot] = [
         "single_small_file": ExpectedFixtureRoot(
             root: "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe",
@@ -20,7 +39,7 @@ final class FixtureRootParityTests: XCTestCase {
             dagSize: 1_467
         ),
         "single_large_file": ExpectedFixtureRoot(
-            root: "bafireighsz3l24ndzdt4vthraeydfc3ilzajmj56ozbcjav2oablln2zzy",
+            root: goSingleLargeFileRoot,
             leaves: 5,
             chunks: 3,
             contentSize: 10_240,
@@ -48,7 +67,7 @@ final class FixtureRootParityTests: XCTestCase {
             dagSize: 7_120
         ),
         "mixed_sizes": ExpectedFixtureRoot(
-            root: "bafireigsytb3lqy7xxuq53376n4xypeyyn3f6a4hnznxso4r52aeobjpsi",
+            root: goMixedSizesRoot,
             leaves: 12,
             chunks: 6,
             contentSize: 26_752,
