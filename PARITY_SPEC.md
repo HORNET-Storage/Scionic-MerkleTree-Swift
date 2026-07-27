@@ -386,6 +386,8 @@ Once your port creates DAGs with matching root hashes, verify these operations:
 - Each packet's leaf can be independently verified
 - `DagStore.AddTransmissionPacket()` verifies root leaves, child leaves, parent links, and required Merkle proofs before storing
 - Batched transmission packets round-trip through JSON and CBOR
+- Current batched encoders include `PacketIndex` and `TotalPackets` in BFS batch order so transports can negotiate bounded sliding windows without weakening per-packet verification
+- Batched decoders accept legacy packets that omit both counters and surface zero values, preserving stop-and-wait compatibility with previously stored and deployed data
 - Batch-size checks use the CBOR-encoded packet size, not JSON text size
 - Applying batched packets to an empty `Dag` reconstructs and verifies the original
 - Applying batched packets to an empty `DagStore` reconstructs and passes `VerifyStreaming()`

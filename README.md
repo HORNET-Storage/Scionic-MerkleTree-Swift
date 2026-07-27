@@ -78,7 +78,7 @@ Both produce root hash `bafireidb74bnd3jalcdjrog3sgnfdkxblqlphtkvbycksk3qpvrzbwz
 - **Verification** — full DAG verification + partial DAG verification with stored Merkle proofs
 - **ContentSize/DagSize validation** — root leaf recalculates and verifies sizes from children when a full DAG is available
 - **Serialization** — JSON and CBOR round-trip through SerializableDag intermediate
-- **Transmission** — individual packets (GetLeafSequence) and batched packets (GetBatchedLeafSequence)
+- **Transmission** — individual and size-limited batched packets; current batches carry deterministic packet counters for bounded sliding-window transports, while legacy counter-free packets remain decodable
 - **Diffing** — compute diffs between DAG versions, apply diffs, create partial DAGs from diffs
 - **Persistent storage** — LeafStore/ContentStore protocol-based backends with MemoryStore implementations
 - **Cross-platform** — builds and tests pass on macOS, iOS, Linux, and Windows
@@ -138,7 +138,7 @@ for packet in packets {
     try receiver.applyAndVerifyTransmissionPacket(packet)
 }
 
-// Batched (size-limited)
+// Batched (size-limited, with PacketIndex/TotalPackets transport metadata)
 let batches = dag.getBatchedLeafSequence()
 for batch in batches {
     try receiver.applyAndVerifyBatchedTransmissionPacket(batch)

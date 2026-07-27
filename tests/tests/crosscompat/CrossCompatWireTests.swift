@@ -15,16 +15,16 @@ import XCTest
 ///     ├── readme.md      = "hello golden repos"   (18 bytes)
 ///     └── docs/guide.md  = "swift parity guide"   (18 bytes)
 ///
-/// Deployed wire truths pinned here — the exact facts the Nosis mobile client
-/// depends on:
+/// Wire truths pinned here — the exact facts the Nosis mobile client depends on:
 ///  1. Per-leaf ContentSize/DagSize are NEVER populated by Go's BuildLeaf:
 ///     file leaves ride the wire with ContentSize=0 even when Content is
 ///     present; only BuildRootLeaf computes root-leaf aggregates. (This is the
 ///     wire truth behind the mobile "Zero KB" / "verified bytes do not match
 ///     authenticated file size" bug — and per-leaf ContentSize is not covered
 ///     by the leaf CID either, so it can never be an authentication input.)
-///  2. A batched packet carries EXACTLY the keys Leaves + Relationships:
-///     PacketIndex/TotalPackets never exist on the wire.
+///  2. Legacy batched packets carry Leaves + Relationships only. Current packets
+///     add PacketIndex + TotalPackets as transport metadata, while tolerant decoders
+///     preserve compatibility by treating their absence as zero.
 ///  3. Leaf CBOR keys are Go's PascalCase field names plus "stored_proofs".
 ///  4. The Swift builder reproduces the Go root CID for the identical tree.
 final class CrossCompatWireTests: XCTestCase {
@@ -93,36 +93,35 @@ final class CrossCompatWireTests: XCTestCase {
 
     // MARK: - Wire shape (keys) parity, Go bytes and Swift bytes
 
-    func testBatchedPacketWireShape_MatchesGoExactly() throws {
+    func testBatchedPacketWireShape_PreservesLegacyAndMatchesCurrentGo() throws {
         let decoder = CBORDecoder()
 
-        // Go side: pin the exact ordered key layout of the golden bytes.
+        // Deployed golden bytes remain valid legacy packets with no counters.
         for hexPacket in CrossCompatWireVectors.skeletonPacketsHex + CrossCompatWireVectors.selectedLeafPacketsHex {
             let packetMap = try XCTUnwrap(decoder.decode(try dataFromHex(hexPacket)).mapValue)
-            XCTAssertEqual(packetMap.pairs.map(\.key), ["Leaves", "Relationships"],
-                "Go batched packets carry exactly Leaves + Relationships — never PacketIndex/TotalPackets")
+            XCTAssertEqual(packetMap.pairs.map(\.key), ["Leaves", "Relationships"])
             try assertLeafKeyOrder(in: packetMap)
         }
 
-        // Swift side: our encoder must emit the identical layout for a real DAG.
+        // Current Go and Swift encoders include deterministic transport counters.
         let repoDir = try makeGoldenRepoDirectory()
         defer { try? FileManager.default.removeItem(atPath: repoDir.base) }
         let built = try ScionicMerkleTree.createDag(path: repoDir.repo, timestampRoot: false)
         let batches = built.getBatchedLeafSequence()
         XCTAssertFalse(batches.isEmpty)
-        for batch in batches {
+        for (index, batch) in batches.enumerated() {
             let packetMap = try XCTUnwrap(decoder.decode(batch.toCBOR()).mapValue)
-            XCTAssertEqual(packetMap.pairs.map(\.key), ["Leaves", "Relationships"],
-                "Swift toCBOR must emit exactly Leaves + Relationships, like Go")
+            XCTAssertEqual(packetMap.pairs.map(\.key), ["Leaves", "Relationships", "PacketIndex", "TotalPackets"])
+            XCTAssertEqual(packetMap["PacketIndex"]?.intValue, index)
+            XCTAssertEqual(packetMap["TotalPackets"]?.intValue, batches.count)
             try assertLeafKeyOrder(in: packetMap)
         }
     }
 
     func testBatchedPacketFromCBOR_ToleratesAbsentCounters() throws {
-        // Real Go wire bytes never contain PacketIndex/TotalPackets; the tolerant
-        // decoder must surface them as 0 instead of failing or inventing values.
-        // (Receivers keep counter guards purely as anti-abuse for senders that DO
-        // declare counters — they never fire on deployed relay traffic.)
+        // Historical Go wire bytes do not contain PacketIndex/TotalPackets; the tolerant
+        // decoder must surface them as 0 so mixed-version peers use stop-and-wait fallback.
+        // Current counter-bearing packets negotiate bounded sliding-window transport.
         for hexPacket in CrossCompatWireVectors.skeletonPacketsHex + CrossCompatWireVectors.selectedLeafPacketsHex {
             let packet = try BatchedTransmissionPacket.fromCBOR(try dataFromHex(hexPacket))
             XCTAssertEqual(packet.packetIndex, 0)

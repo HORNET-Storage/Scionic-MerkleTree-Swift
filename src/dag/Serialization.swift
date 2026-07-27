@@ -459,6 +459,8 @@ extension BatchedTransmissionPacket {
         return encoder.encodeMap([
             ("Leaves", leavesValue),
             ("Relationships", .map(CBOROrderedMap(relationshipPairs))),
+            ("PacketIndex", s.packetIndex >= 0 ? .unsignedInt(UInt64(s.packetIndex)) : .negativeInt(Int64(s.packetIndex))),
+            ("TotalPackets", s.totalPackets >= 0 ? .unsignedInt(UInt64(s.totalPackets)) : .negativeInt(Int64(s.totalPackets))),
         ])
     }
 
