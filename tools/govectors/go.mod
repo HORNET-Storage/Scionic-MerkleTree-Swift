@@ -23,3 +23,5 @@ require (
 	golang.org/x/sys v0.37.0 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
+
+replace github.com/HORNET-Storage/Scionic-Merkle-Tree/v2 => ../../../scionic-merkletree
