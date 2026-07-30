@@ -88,7 +88,7 @@ Alphabet: `123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`
 | Input (hex) | Base58btc |
 |-------------|----------|
 | `48656c6c6f20576f726c6421` ("Hello World!") | `2NEpo7TZRRrLZSi2U` |
-| `00002887f4b4cd` | `11233QC4` |
+| `0000287fb4cd` | `11233QC4` |
 | `00` | `1` |
 | `0000` | `11` |
 
