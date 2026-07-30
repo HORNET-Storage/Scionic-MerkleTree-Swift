@@ -171,7 +171,11 @@ public func mixedSizes() -> TestFixture {
         },
         expectedFiles: 5,
         expectedDirs: 0,
-        expectedChunks: 6  // 0 + 0 + 2 + 4 + 0
+        // 6 chunk positions (0 + 0 + 2 + 4 + 0 — exact_chunk.txt is exactly one
+        // chunk size, so it is never chunked), but chunk bytes are a function of
+        // absolute offset, so medium.txt[0] and large.txt[0] are the same 4096
+        // bytes under the same "0" name and dedupe into one shared leaf.
+        expectedChunks: 5
     )
 }
 

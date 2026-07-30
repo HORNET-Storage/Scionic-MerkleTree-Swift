@@ -2,20 +2,12 @@ import Foundation
 import XCTest
 @testable import ScionicMerkleTree
 
-// Chunked-file DAG roots are PLATFORM-OF-CREATION dependent, faithfully mirroring
-// Go: chunk leaves are named filepath.Join(relPath, index) (dag/dag.go in
-// HORNET-Storage/Scionic-Merkle-Tree/v2), so identical bytes chunk-join with '\'
-// on Windows and '/' elsewhere and yield different CIDs. Unchunked fixtures are
-// platform-independent because file relPaths are '/'-normalized on every platform.
-// Both pin sets below are authoritative Go v2.2.6 output, regenerated with
-// tools/gofixtureroots on each platform (windows and linux runs verified).
-#if os(Windows)
-private let goSingleLargeFileRoot = "bafireighsz3l24ndzdt4vthraeydfc3ilzajmj56ozbcjav2oablln2zzy"
-private let goMixedSizesRoot = "bafireigsytb3lqy7xxuq53376n4xypeyyn3f6a4hnznxso4r52aeobjpsi"
-#else
-private let goSingleLargeFileRoot = "bafireid6hb33tyj2vjeaviawjjkitpupu2xsyf3u4jziymh3eqlpv66zuq"
-private let goMixedSizesRoot = "bafireihuepywkbxfknipjupyd47yyu7f7nuddndtb4vdai7kinfebi7yhm"
-#endif
+// Every fixture root below is platform-independent: Windows, Linux, macOS and
+// iOS all produce the same CIDs for the same bytes. Chunked roots used to be
+// pinned per platform because Go and this port both named chunk leaves by
+// joining relPath with an OS-dependent separator (filepath.Join in dag/dag.go);
+// both now emit the bare chunk index, which carries no separator at all. All
+// values are authoritative Go output regenerated with tools/gofixtureroots.
 
 final class FixtureRootParityTests: XCTestCase {
     private struct ExpectedFixtureRoot {
@@ -26,10 +18,8 @@ final class FixtureRootParityTests: XCTestCase {
         let dagSize: Int64
     }
 
-    /// Authoritative Go v2.2.6 values from tools/gofixtureroots. Roots for the
-    /// chunked fixtures are per-platform (see the header comment); every other
-    /// field is platform-independent ('\' and '/' have equal byte length, so
-    /// even dagSize matches across platforms).
+    /// Authoritative Go values from tools/gofixtureroots. Every field, including
+    /// the chunked-fixture roots, is identical on every platform.
     private let expectedByFixture: [String: ExpectedFixtureRoot] = [
         "single_small_file": ExpectedFixtureRoot(
             root: "bafireiabahlly4rktdhsvhzgd2prjurwuupjo5shdsefkpayhfqefhcvpe",
@@ -39,11 +29,11 @@ final class FixtureRootParityTests: XCTestCase {
             dagSize: 1_467
         ),
         "single_large_file": ExpectedFixtureRoot(
-            root: goSingleLargeFileRoot,
+            root: "bafireiel7coatk47jhcsatc4xdjxx3jx7fdqteplhtlxb7y27bzwnstvwy",
             leaves: 5,
             chunks: 3,
             contentSize: 10_240,
-            dagSize: 11_611
+            dagSize: 11_581
         ),
         "flat_directory": ExpectedFixtureRoot(
             root: "bafireigd6awocke3nmagbspbkv2rfiqqai455eimle27u36ljeytyqdb4u",
@@ -66,12 +56,15 @@ final class FixtureRootParityTests: XCTestCase {
             contentSize: 3_840,
             dagSize: 7_120
         ),
+        // medium.txt and large.txt open with byte-identical content, so their
+        // first chunk is a single content-addressed leaf shared by both files:
+        // 11 leaves and 5 chunks rather than 12 and 6.
         "mixed_sizes": ExpectedFixtureRoot(
-            root: goMixedSizesRoot,
-            leaves: 12,
-            chunks: 6,
-            contentSize: 26_752,
-            dagSize: 30_009
+            root: "bafireibrvfd6b3unpr27mq72pdsksj26y6hq32ahjmy6i7omfresfleloq",
+            leaves: 11,
+            chunks: 5,
+            contentSize: 22_656,
+            dagSize: 25_612
         ),
     ]
 
@@ -120,7 +113,7 @@ final class FixtureRootParityTests: XCTestCase {
         }
     }
 
-    func testNestedChunkedFileRootMatchesGoOnWindowsPaths() throws {
+    func testNestedChunkedFileRootMatchesGo() throws {
         setChunkSize(4096)
         defer { setDefaultChunkSize() }
 
@@ -138,17 +131,21 @@ final class FixtureRootParityTests: XCTestCase {
         let rootLeaf = try XCTUnwrap(dag.leafs[dag.root])
         let chunkCount = dag.leafs.values.filter { $0.type == .chunk }.count
 
-#if os(Windows)
-        XCTAssertEqual(dag.root, "bafireifmsypsphu6rwh46fnkhma5kzxwrhdgqog7fardsg5p3bpuiu6kxe")
-        XCTAssertTrue(dag.leafs.values.contains { $0.type == .chunk && $0.itemName.contains("\\") })
-#else
-        XCTAssertTrue(dag.leafs.values.contains { $0.type == .chunk && $0.itemName.contains("/") })
-#endif
+        // A chunked file nested inside directories is exactly the case that used
+        // to diverge per platform. Chunk names now carry no path and therefore no
+        // separator, so this root is identical on every OS.
+        XCTAssertEqual(dag.root, "bafireicgewyfpgq5ywxpx7wddgo56ghfeq6a5sszivzwt4h32xufds4s3u")
+        for leaf in dag.leafs.values where leaf.type == .chunk {
+            XCTAssertFalse(leaf.itemName.contains("/"), leaf.itemName)
+            XCTAssertFalse(leaf.itemName.contains("\\"), leaf.itemName)
+            XCTAssertNotNil(Int(leaf.itemName), leaf.itemName)
+        }
+
         XCTAssertEqual(dag.leafs.count, 7)
         XCTAssertEqual(rootLeaf.leafCount, 7)
         XCTAssertEqual(chunkCount, 3)
         XCTAssertEqual(rootLeaf.contentSize, 10_000)
-        XCTAssertEqual(rootLeaf.dagSize, 12_026)
+        XCTAssertEqual(rootLeaf.dagSize, 11_996)
         try dag.verify()
     }
 }

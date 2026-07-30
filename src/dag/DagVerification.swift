@@ -94,12 +94,16 @@ extension Dag {
             // Verify path to root
             var current = leaf
             while current.hash != root {
-                // Find parent
+                // Pick the lowest-hash parent that links this leaf. Dictionary
+                // order is unspecified, so a chunk shared by several parents
+                // resolved to an arbitrary one, and the proof lookup below then
+                // missed at random depending on iteration order.
                 var parent: DagLeaf? = nil
                 for (_, potential) in leafs {
                     if potential.hasLink(current.hash) {
-                        parent = potential
-                        break
+                        if parent == nil || potential.hash < parent!.hash {
+                            parent = potential
+                        }
                     }
                 }
                 guard let parent = parent else {
@@ -150,10 +154,18 @@ extension Dag {
     ///
     /// Mirrors Go's `IterateDag`. The callback receives (leaf, parent) where parent is nil for root.
     public func iterateDag(_ processLeaf: (DagLeaf, DagLeaf?) throws -> Void) throws {
+        // Content-addressed chunks dedupe, so one leaf can be linked by several
+        // parents. Without a visited set the traversal revisits it once per
+        // parent, which double-counts labels and can recurse without end.
+        var visited = Set<String>()
+
         func iterate(leafHash: String, parentHash: String?) throws {
             guard let leaf = leafs[leafHash] else {
                 throw DagError.childMissing(leafHash)
             }
+
+            if visited.contains(leafHash) { return }
+            visited.insert(leafHash)
 
             var parent: DagLeaf? = nil
             if let ph = parentHash {
@@ -300,6 +312,12 @@ extension Dag {
             addBranchToPartial(branch, partial: partial)
         }
 
+        // Each branch only carries proofs along its own path to root. A chunk
+        // linked by two parents therefore ends up with a proof on one parent and
+        // none on the other, so verifying through the other parent fails.
+        // Fill in every parent -> child proof the partial can still prove.
+        completeParentProofs(partial: partial)
+
         if pruneLinks {
             pruneIrrelevantLinks(partial: partial, relevantHashes: relevantHashes)
         }
@@ -307,22 +325,35 @@ extension Dag {
         return partial
     }
 
+    /// Returns a child-hash -> parent-hash index. A content-identical leaf can
+    /// be linked by several parents, so pin each child to its lowest parent hash
+    /// rather than to whichever parent dictionary order happened to yield first,
+    /// which made every proof derived from this index nondeterministic.
+    /// Mirrors Go's `buildParentIndex`.
+    func buildParentIndex() -> [String: String] {
+        var parentOf: [String: String] = [:]
+        parentOf.reserveCapacity(leafs.count)
+        for (_, leaf) in leafs {
+            for childHash in leaf.links {
+                if let existing = parentOf[childHash] {
+                    if leaf.hash < existing { parentOf[childHash] = leaf.hash }
+                } else {
+                    parentOf[childHash] = leaf.hash
+                }
+            }
+        }
+        return parentOf
+    }
+
     func buildVerificationBranch(_ leaf: DagLeaf) throws -> DagBranch {
         let rootLeaf = leafs[root]!.clone()
+        let parentOf = buildParentIndex()
 
         var branch = DagBranch(leaf: leaf.clone(), path: [rootLeaf])
 
         var current = leaf
         while current.hash != root {
-            // Find parent
-            var parent: DagLeaf? = nil
-            for (_, potential) in leafs {
-                if potential.hasLink(current.hash) {
-                    parent = potential
-                    break
-                }
-            }
-            guard let parent = parent else {
+            guard let parentHash = parentOf[current.hash], let parent = leafs[parentHash] else {
                 throw DagError.brokenPathToRoot(current.hash)
             }
 
@@ -395,6 +426,25 @@ extension Dag {
                         partialNode.addLink(next.hash)
                     }
                 }
+            }
+        }
+    }
+
+    /// Fills in every parent -> child Merkle proof the partial DAG can prove
+    /// from the full DAG, so a chunk shared by several parents verifies through
+    /// whichever parent the verifier happens to walk.
+    ///
+    /// Runs before pruning because the Merkle tree must be built over the
+    /// parent's complete original link set, not the pruned one.
+    private func completeParentProofs(partial: Dag) {
+        for (parentHash, partialParent) in partial.leafs {
+            guard let fullParent = leafs[parentHash], fullParent.links.count > 1 else { continue }
+
+            for childHash in fullParent.links {
+                guard partial.leafs[childHash] != nil else { continue }
+                if partialParent.proofs[childHash] != nil { continue }
+                guard let proof = proofForChild(parent: fullParent, childHash: childHash) else { continue }
+                partialParent.proofs[childHash] = proof
             }
         }
     }

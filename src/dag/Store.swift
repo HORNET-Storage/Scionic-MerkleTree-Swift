@@ -479,12 +479,19 @@ public class DagStore {
     }
 
     private func findParentStreaming(childHash: String) throws -> DagLeaf? {
+        // Pick the lowest-hash parent that links this child. Store enumeration
+        // order is unspecified, so a chunk shared by several parents used to
+        // resolve to an arbitrary one and its proof lookup could miss at random.
         let leafHashes = try collectAllLeafHashesForPartialDag()
+        var best: DagLeaf? = nil
         for hash in leafHashes {
             guard let leaf = try retrieveLeafWithoutContent(hash) else { continue }
-            if leaf.hasLink(childHash) { return leaf }
+            guard leaf.hasLink(childHash) else { continue }
+            if best == nil || leaf.hash < best!.hash {
+                best = leaf
+            }
         }
-        return nil
+        return best
     }
 
     private func collectAllLeafHashesForPartialDag() throws -> [String] {

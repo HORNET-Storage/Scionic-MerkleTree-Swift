@@ -1,18 +1,23 @@
 // Command gofixtureroots prints the DAG root (and structural stats) that the
-// DEPLOYED Go Scionic Merkle Tree implementation (v2.2.6 — the version pinned
-// by HORNETS-Nostr-Relay and hdk-nostr-go) computes for the exact deterministic
-// fixtures defined in src/testutil/Fixtures.swift. These are the authoritative
-// expectations behind tests/tests/FixtureRootParityTests.swift.
+// deployed Go Scionic Merkle Tree implementation computes for the exact
+// deterministic fixtures defined in src/testutil/Fixtures.swift. These are the
+// authoritative expectations behind tests/tests/FixtureRootParityTests.swift.
 //
-// Chunked-file DAG roots are PLATFORM-OF-CREATION dependent upstream: Go names
-// chunk leaves with filepath.Join(relPath, strconv.Itoa(i)) (dag/dag.go), so the
-// same bytes chunk-join with '\' on Windows and '/' on Unix and produce
-// different CIDs. Unchunked fixtures are platform-independent because file
-// relPaths are '/'-normalized on every platform. FixtureRootParityTests.swift
-// therefore pins per-platform roots for the chunked fixtures. Regenerate with:
+// All fixture roots, including the chunked ones, are platform-independent.
+// Chunk leaves are named with the bare chunk index (dag/dag.go processFile and
+// processFileParallel, and nosis-cli's buildGitFileLeaf), so no path separator
+// enters a chunk ItemName. Chunked roots used to be per-platform because chunk
+// leaves were named with filepath.Join(relPath, strconv.Itoa(i)), which joins
+// with '\\' on Windows and '/' on Unix and hashes those bytes into the root.
+// The module requirement is redirected by a local replace directive to the
+// sibling scionic-merkletree checkout, so these roots are computed from the
+// working tree rather than from a published release. That matters: the
+// expectations have to cover unreleased changes, and pinning a published
+// version would silently generate them from different code than the port is
+// tested against. Regenerate with:
 //
 //   cd tools/gofixtureroots
-//   go mod tidy && go run .        (run on each platform of interest)
+//   go mod tidy && go run .
 package main
 
 import (
@@ -126,9 +131,15 @@ func scionicVersion() string {
 		return "unknown"
 	}
 	for _, dep := range info.Deps {
-		if dep.Path == "github.com/HORNET-Storage/Scionic-Merkle-Tree/v2" {
-			return dep.Version
+		if dep.Path != "github.com/HORNET-Storage/Scionic-Merkle-Tree/v2" {
+			continue
 		}
+		// A replaced module still reports the required version here, which would
+		// credit these roots to a published release they did not come from.
+		if dep.Replace != nil {
+			return fmt.Sprintf("%s (replaced by %s)", dep.Version, dep.Replace.Path)
+		}
+		return dep.Version
 	}
 	return "unknown"
 }

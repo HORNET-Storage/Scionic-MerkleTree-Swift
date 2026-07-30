@@ -39,19 +39,18 @@ extension Dag {
                 if !visited.contains(childHash) {
                     guard let childLeaf = leafs[childHash] else { continue }
 
-                    // Build verification branch for proofs
-                    let branch = try? buildVerificationBranch(childLeaf)
+                    // Build the proof against the parent this packet declares.
+                    // buildVerificationBranch resolves a parent by scanning the
+                    // leafs dictionary, whose order is unspecified, so a chunk
+                    // linked by several parents could be given a proof belonging
+                    // to a different parent than parentHash and fail to verify.
+                    let proof = proofForChild(parent: currentLeaf, childHash: childHash)
 
                     let leafClone = childLeaf.clone()
                     var packet = TransmissionPacket(leaf: leafClone, parentHash: current)
 
-                    // Extract proofs from branch path nodes
-                    if let branch = branch {
-                        for pathNode in branch.path {
-                            for (k, v) in pathNode.proofs {
-                                packet.proofs[k] = v
-                            }
-                        }
+                    if let proof = proof {
+                        packet.proofs[childHash] = proof
                     }
 
                     sequence.append(packet)
@@ -142,14 +141,13 @@ extension Dag {
             }
         }
 
-        // Apply proofs to parent leaves
-        for (leafHash, proof) in packet.proofs {
-            for (_, leaf) in leafs {
-                if leaf.hasLink(leafHash) {
-                    leaf.proofs[leafHash] = proof
-                    break
-                }
-            }
+        // Attach the proof to the parent this packet declares. Scanning every
+        // leaf for one that links the child selected an arbitrary parent, so a
+        // chunk shared by two parents could receive the wrong parent's proof.
+        if !packet.parentHash.isEmpty,
+           let parent = leafs[packet.parentHash],
+           let proof = packet.proofs[packet.leaf.hash] {
+            parent.proofs[packet.leaf.hash] = proof
         }
     }
 
@@ -157,6 +155,26 @@ extension Dag {
     public func applyAndVerifyTransmissionPacket(_ packet: TransmissionPacket) throws {
         try verifyTransmissionPacket(packet)
         applyTransmissionPacket(packet)
+    }
+
+    /// Builds the Merkle proof for `childHash` against the specific parent leaf
+    /// that links it, so a proof always corresponds to the parent naming it
+    /// rather than to whichever parent a dictionary happened to yield first.
+    /// Returns nil when the parent has at most one link, matching the condition
+    /// under which `verifyTransmissionPacket` requires no proof.
+    func proofForChild(parent: DagLeaf, childHash: String) -> ClassicTreeBranch? {
+        guard parent.links.count > 1 else { return nil }
+
+        let builder = TreeContent()
+        for linkHash in parent.links {
+            builder.addLeaf(key: linkHash, data: linkHash)
+        }
+        guard let (merkleTree, _) = try? builder.build() else { return nil }
+
+        let (index, exists) = merkleTree.getIndexForKey(childHash)
+        guard exists else { return nil }
+
+        return ClassicTreeBranch(leaf: childHash, proof: merkleTree.proofs[index])
     }
 
     /// Removes all content from leaves (for transmission without file data).

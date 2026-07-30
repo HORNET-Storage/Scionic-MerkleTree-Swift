@@ -219,8 +219,7 @@ private func processFile(
         // Multiple chunks — process as child leaves
         if chunkCount == 2, let firstChunk = singleChunk {
             // Process the first chunk we stored earlier
-            let chunkEntryPath = chunkItemName(relPath: relPath, index: 0)
-            let chunkBuilder = DagLeafBuilder(name: chunkEntryPath)
+            let chunkBuilder = DagLeafBuilder(name: "0")
             chunkBuilder.setType(.chunk)
             chunkBuilder.setData(firstChunk)
 
@@ -231,8 +230,7 @@ private func processFile(
         }
 
         // Process current chunk
-        let chunkEntryPath = chunkItemName(relPath: relPath, index: index)
-        let chunkBuilder = DagLeafBuilder(name: chunkEntryPath)
+        let chunkBuilder = DagLeafBuilder(name: String(index))
         chunkBuilder.setType(.chunk)
         chunkBuilder.setData(chunk)
 
@@ -306,13 +304,12 @@ private func relativePath(from base: String, to target: String) -> String {
     return relativeParts.joined(separator: "/")
 }
 
-private func chunkItemName(relPath: String, index: Int) -> String {
-#if os(Windows)
-    return "\(relPath)\\\(index)"
-#else
-    return (relPath as NSString).appendingPathComponent("\(index)")
-#endif
-}
+// Chunk leaves are named with the bare chunk index ("0", "1", "2", ...), which
+// is what Go's processFile, processFileParallel and buildGitFileLeaf all emit.
+// This file previously joined relPath with an OS-dependent separator to mirror
+// Go's filepath.Join, which made every chunked-file CID depend on the platform
+// that created the DAG. A chunk name is a synthetic label, not a filesystem
+// path, so no separator belongs in it.
 
 // MARK: - Parallel DAG Creation
 

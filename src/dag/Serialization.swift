@@ -164,13 +164,16 @@ extension Dag {
             }
         }
 
-        // Third pass: reconstruct parent hashes
+        // Third pass: reconstruct parent hashes via a single child -> parent
+        // index. buildParentIndex resolves a content-identical leaf's several
+        // parents to the lowest parent hash; the nested scan this replaced kept
+        // whichever parent dictionary order yielded first, so a shared chunk's
+        // parentHash changed from one deserialization of the same bytes to the
+        // next. It is also O(n) rather than O(n^2).
+        let parentOf = dag.buildParentIndex()
         for (hash, leaf) in dag.leafs {
-            for (_, potential) in dag.leafs {
-                if potential.hasLink(hash) {
-                    leaf.parentHash = potential.hash
-                    break
-                }
+            if let parentHash = parentOf[hash] {
+                leaf.parentHash = parentHash
             }
         }
 
