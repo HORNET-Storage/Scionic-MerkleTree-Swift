@@ -2,11 +2,11 @@
 
 A comprehensive Swift port of [Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) — a hybrid Merkle DAG / Merkle Tree data structure that combines the folder support of IPFS Merkle DAGs with the small branches of Classic Merkle Trees.
 
-**Proven byte-identical with the Go implementation** — 12 cross-compatibility tests verify that Swift produces the exact same CID hashes as Go for the same input, from individual leaves to full multi-level directory DAGs.
+**Proven byte-identical with the Go implementation** — 18 cross-compatibility tests verify that Swift produces the exact same CID hashes as Go for the same input, from individual leaves to full multi-level directory DAGs, backed by a further 19 Go-parity tests covering spec vectors, fixture roots and transmission packets.
 
 ## What’s Ported
 
-This is a near-complete port of the Go library. **18 source files, 227 tests.**
+This is a near-complete port of the Go library. **18 source files, 243 tests.** (`swift test` on Windows/Swift 6.3.1: 243 executed, 7 skipped, 0 failures.)
 
 ### Core (fully ported)
 
@@ -35,17 +35,20 @@ This is a near-complete port of the Go library. **18 source files, 227 tests.**
 
 ## Cross-Compatibility Proof
 
-**12 cross-compatibility tests** verify byte-identical output between Go and Swift at every level of the stack:
+**18 cross-compatibility tests** (`tests/tests/crosscompat/`) verify byte-identical output between Go and Swift at every level of the stack:
 
 | Layer | Test | Verified |
 |-------|------|----------|
-| Classic Merkle Tree | 2, 3, 5, 100-leaf trees | Root hashes + proof paths + siblings match |
+| Classic Merkle Tree | 2-, 3- and 5-leaf trees, plus CID-like keys | Root hashes + proof paths + siblings match |
 | Individual leaf hashing | file, chunk, directory leaves | CID strings match |
 | Leaf with content | SHA-256 content hash | CID matches |
 | Leaf with metadata | AdditionalData map | CID matches |
 | Full DAG (manual) | 2 files + root directory | Root hash + child hashes + LeafCount + ContentSize + DagSize match |
 | Full DAG (filesystem) | 3 files + 1 subdir | Root hash matches, verify passes, directory recreation matches |
 | **Deep directory** | **7 files, 4 subdirs, 3 levels deep** | **All 12 leaf hashes match, verify passes, all file contents recreated correctly** |
+| Wire format | Go skeleton and selected-leaf vectors, batched packet shape | Decodes and verifies against golden Go bytes; legacy counter-free packets stay decodable |
+
+A further **19 Go-parity tests** sit outside that directory: `SpecVectorParityTests` (7) walks the `PARITY_SPEC.md` vectors, `TransmissionParityTests` (9) covers packet flows, and `FixtureRootParityTests` (3) pins the standard fixture roots.
 
 The deep directory test creates this structure in both Go and Swift:
 ```
@@ -96,7 +99,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/HORNET-Storage/ScionicMerkleTreeSwift.git", from: "2.0.0"),
+    .package(url: "https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift.git", from: "2.4.0"),
 ]
 ```
 
@@ -195,11 +198,13 @@ tests/
 ├── classic-tree-wrapper/ — Go tree wrapper parity tests
 ├── tests/                — Go-style integration, DAG, partial, store, store-index, streaming, transmission, fixture, and cross-compat tests
 ├── AuditTests.swift      — clone, serialization, store, transmission, diff, partial flows
+├── AuditSecurityTests.swift — path-traversal rejection, streaming tamper detection, forged-child detection
 ├── FixtureTests.swift    — standard fixture coverage across DAG operations
 ├── MerkleTreeTests.swift — classic Merkle Tree build/verify/proof behavior, including parallel/sequential parity
 ├── TreeContentTests.swift — Classic tree wrapper parity for build and verify helpers
 ├── CBORTests.swift       — CBOR encoding/decoding determinism
-└── CIDTests.swift        — varint, base32, base58, CID generation
+├── CIDTests.swift        — varint, base32, base58, CID generation
+└── ScionicMerkleTreeTests.swift — package smoke test
 ```
 
 ## Dependencies

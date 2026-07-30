@@ -2,7 +2,7 @@ module govectors
 
 go 1.24.0
 
-require github.com/HORNET-Storage/Scionic-Merkle-Tree/v2 v2.3.7
+require github.com/HORNET-Storage/Scionic-Merkle-Tree/v2 v2.4.0
 
 require (
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
