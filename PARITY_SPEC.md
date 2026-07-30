@@ -447,14 +447,29 @@ So `nil` input → CBOR empty array (`0x80`), NOT CBOR null (`0xf6`).
 
 ### Chunk naming for multi-chunk files
 
-When a file exceeds `ChunkSize`, chunks are named by joining the relative path with the chunk index:
-- `filepath.Join(relPath, "0")` for chunk 0
-- `filepath.Join(relPath, "1")` for chunk 1
-- etc.
+When a file exceeds `ChunkSize`, each chunk leaf is named with the **bare chunk
+index** — `"0"`, `"1"`, `"2"` — and nothing else. The relative path is **not**
+joined in.
 
-The path separator is hash-visible because the chunk `ItemName` is part of the leaf hash:
-- Windows: `large.bin\0`, `nested\inner\large.bin\1`
-- POSIX: `large.bin/0`, `nested/inner/large.bin/1`
+This is hash-visible, because the chunk `ItemName` is part of the leaf hash.
+Naming chunks with `filepath.Join(relPath, index)` was the original Go behaviour,
+and it made every chunked-file root CID depend on the OS that built the DAG
+(`\` on Windows, `/` elsewhere). Go fixed this in `processFile`,
+`processFileParallel` and `buildGitFileLeaf`; the comment in `dag/dag.go` states
+the rule directly:
+
+> Chunk names are synthetic labels, not filesystem paths. Naming them with
+> `filepath.Join` made the leaf CID depend on the OS that built the DAG
+> ('\' on Windows, '/' elsewhere). A bare index matches processFileParallel
+> and buildGitFileLeaf and is platform-independent.
+
+Both the sequential and parallel Go paths build chunk 0 as
+`CreateDagLeafBuilder("0")` and every later chunk as
+`CreateDagLeafBuilder(strconv.Itoa(index))`.
+
+A port that joins the path here will match no chunked-file reference value in
+§4.3 or §4.4, and its roots will differ across platforms. §4.4 exists precisely
+to pin this case.
 
 Single-chunk files store data directly on the file leaf (no child chunks created).
 
@@ -498,8 +513,8 @@ These test files are in `tests/crosscompat_*.go`.
 | Language | Status | Repository |
 |----------|--------|-----------|
 | **Go** | ✅ Reference implementation | [HORNET-Storage/Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) |
-| **Swift** | ✅ Complete (227 tests, 12 direct cross-compat plus fixture/store/index/streaming/transmission/parallel parity) | This repository |
-| Rust | — | — |
+| **Swift** | ✅ Complete (243 tests, 18 direct cross-compat plus fixture/store/index/streaming/transmission/parallel parity) | This repository |
+| **Rust** | 🚧 Layers 1–4 (46 tests: primitives, classic tree, leaf hashing, sequential filesystem DAG). Layer 5 and parallel creation pending. | `Scionic-MerkleTree-Rust` (local, not yet published) |
 | TypeScript | — | — |
 | Python | — | — |
 | Kotlin | — | — |
