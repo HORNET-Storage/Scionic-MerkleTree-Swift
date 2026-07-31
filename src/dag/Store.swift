@@ -10,15 +10,24 @@ import Foundation
 
 /// Protocol for persistent leaf storage backends.
 ///
-/// **Ownership contract:** every `retrieve*` method must return a leaf the
-/// caller owns and may mutate freely. `DagLeaf` is a class, so returning a
-/// live reference into the store's own storage lets callers write straight
-/// through into the store -- outside the lock, and outside the
-/// content-preservation merge in `storeLeaf`. `DagStore.retrieveLeaf`
-/// depends on this contract directly: it assigns `leaf.content` on whatever
-/// the store hands back. `MemoryLeafStore` honours it by cloning on every
-/// read; conforming stores must do the same.
+/// **Ownership contract, and it runs both directions:**
+///
+/// - `storeLeaf` must not retain the caller's `DagLeaf`. Store a `clone()`.
+/// - every `retrieve*` method must return a leaf the caller owns and may mutate
+///   freely.
+///
+/// `DagLeaf` is a class, so either half done alone still leaves a live reference
+/// spanning the boundary -- writable outside the lock, and outside the
+/// content-preservation merge in `storeLeaf`. Both halves have a caller that
+/// depends on them directly: `DagStore.retrieveLeaf` assigns `leaf.content` on
+/// whatever the store hands back, and `updateParentHashesStreaming` assigns
+/// `leaf.parentHash` before writing it again.
+///
+/// `MemoryLeafStore` honours this by cloning on every read *and* every write;
+/// conforming stores must do the same. Cloning is cheap here: `DagLeaf`'s fields
+/// are value types, so copy-on-write duplicates no bytes until someone writes.
 public protocol LeafStore {
+    /// Takes a leaf the store owns. Must not retain the caller's instance.
     func storeLeaf(_ leaf: DagLeaf) throws
     /// Returns a leaf the caller owns. Must not alias the store's storage.
     func retrieveLeaf(_ hash: String) throws -> DagLeaf?
@@ -110,18 +119,19 @@ public class DagStore {
     // MARK: - Constructors
 
     /// Creates a DagStore from an in-memory DAG, using MemoryLeafStore.
+    ///
+    /// No content store, matching Go's `NewDagStore` and Rust's `DagStore::from_dag`.
+    /// With `separateContent` off the leaf store already holds every payload, so
+    /// attaching a second in-memory store here kept a duplicate copy of every byte
+    /// in the DAG for nothing.
     public convenience init(_ dag: Dag) {
         let memLeafStore = MemoryLeafStore()
-        let memContentStore = MemoryContentStore()
 
         for (_, leaf) in dag.leafs {
             try? memLeafStore.storeLeaf(leaf)
-            if let content = leaf.content {
-                try? memContentStore.storeContent(leaf.hash, content: content)
-            }
         }
 
-        self.init(root: dag.root, leafStore: memLeafStore, contentStore: memContentStore)
+        self.init(root: dag.root, leafStore: memLeafStore)
 
         if let rootLeaf = dag.leafs[dag.root] {
             self.leafCount = rootLeaf.leafCount
@@ -193,11 +203,21 @@ public class DagStore {
         }
     }
 
+    /// Stores a leaf, splitting the payload off when a content store is configured.
+    ///
+    /// The metadata store then holds metadata only. Writing the payload into both
+    /// stores doubles the footprint and defeats the whole reason a separate content
+    /// store gets configured; Go's `StoreLeaf` and Rust's `store_leaf` both strip
+    /// here, and this used to be the odd one out.
     public func storeLeaf(_ leaf: DagLeaf) throws {
-        try leafStore.storeLeaf(leaf)
-        if separateContent, let content = leaf.content, let cs = contentStore {
+        if separateContent, let cs = contentStore, let content = leaf.content, !content.isEmpty {
             try cs.storeContent(leaf.hash, content: content)
+            let withoutContent = leaf.clone()
+            withoutContent.content = nil
+            try leafStore.storeLeaf(withoutContent)
+            return
         }
+        try leafStore.storeLeaf(leaf)
     }
 
     public func setRoot(_ rootHash: String) throws {
@@ -234,11 +254,20 @@ public class DagStore {
         var newIndex = DagIndex()
 
         for (childHash, parentHash) in relationships {
-            newIndex.parents[childHash] = parentHash
             if !parentHash.isEmpty {
                 newIndex.children[parentHash, default: []].append(childHash)
             }
         }
+
+        // A relationship cache stores one parent per child, so a shared chunk's
+        // other parent edges are already discarded before we get here and cannot
+        // be re-derived from them. Route this through the same single rule as
+        // every other path anyway, so a cache that does supply canonical parents
+        // stays canonical. The contract that follows: getCachedRelationships must
+        // report the LOWEST parent hash for a child with several parents, or
+        // return nil so the caller falls back to full traversal.
+        newIndex.parents = minimumParentIndex(newIndex.children)
+        newIndex.parents[root] = ""
 
         var visited = Set<String>()
         var queue = [root]
@@ -271,35 +300,48 @@ public class DagStore {
     private func buildIndexByTraversal() throws {
         var newIndex = DagIndex()
         var visited = Set<String>()
-        var queue: [(hash: String, parentHash: String)] = [(root, "")]
+        // The walk deliberately carries no parent. The child -> parent direction
+        // is derived afterwards by minimumParentIndex, so a traversal parent kept
+        // here would be dead state that still reads as authoritative -- which is
+        // how it came to be written into the index in the first place.
+        var queue: [String] = [root]
         var cursor = 0
 
         while cursor < queue.count {
             let current = queue[cursor]
             cursor += 1
 
-            if visited.contains(current.hash) { continue }
-            visited.insert(current.hash)
+            if visited.contains(current) { continue }
+            visited.insert(current)
 
-            guard let leaf = try leafStore.retrieveLeafWithoutContent(current.hash) else {
+            guard let leaf = try leafStore.retrieveLeafWithoutContent(current) else {
                 continue
             }
 
-            newIndex.leafHashes.append(current.hash)
-            newIndex.parents[current.hash] = current.parentHash
+            newIndex.leafHashes.append(current)
 
             if !leaf.links.isEmpty {
                 let children = leaf.links
-                newIndex.children[current.hash] = children
+                newIndex.children[current] = children
                 for childHash in children where !visited.contains(childHash) {
-                    queue.append((childHash, current.hash))
+                    queue.append(childHash)
                 }
             }
 
-            if current.hash == root {
+            if current == root {
                 leafCount = leaf.leafCount
             }
         }
+
+        // The walk above fixes leafHashes order (parents before children, which
+        // transmission requires) and collects every parent -> children edge. The
+        // child -> parent direction is resolved only now, because a shared
+        // chunk's FIRST-SEEN parent depends on traversal order while its
+        // parentHash must not: fromSerializable pins it to the lowest parent
+        // hash, so a store load has to agree with a decode of the same DAG.
+        // Recording the traversal parent here is what made those two disagree.
+        newIndex.parents = minimumParentIndex(newIndex.children)
+        newIndex.parents[root] = ""
 
         index = newIndex
         indexBuilt = true
@@ -621,12 +663,7 @@ public class DagStore {
                 chunks.append(ChunkInfo(hash: link, itemName: child.itemName))
             }
         }
-        chunks.sort { a, b in
-            let baseA = (a.itemName as NSString).lastPathComponent
-            let baseB = (b.itemName as NSString).lastPathComponent
-            if let numA = Int(baseA), let numB = Int(baseB) { return numA < numB }
-            return a.itemName < b.itemName
-        }
+        chunks.sort { compareChunkItemNames($0.itemName, $1.itemName) }
         for chunk in chunks {
             if let child = try retrieveLeaf(chunk.hash), let c = child.content {
                 content.append(c)
@@ -660,12 +697,7 @@ public class DagStore {
             chunks.append(ChunkInfo(hash: link, itemName: child.itemName))
         }
 
-        chunks.sort { a, b in
-            let baseA = (a.itemName as NSString).lastPathComponent
-            let baseB = (b.itemName as NSString).lastPathComponent
-            if let numA = Int(baseA), let numB = Int(baseB) { return numA < numB }
-            return a.itemName < b.itemName
-        }
+        chunks.sort { compareChunkItemNames($0.itemName, $1.itemName) }
 
         var content = Data()
         for chunk in chunks {
@@ -977,7 +1009,11 @@ public class MemoryLeafStore: LeafStore, BatchLeafStore, LeafCounter, LeafEnumer
             merged.content = existingContent
             leaves[leaf.hash] = merged
         } else {
-            leaves[leaf.hash] = leaf
+            // Clone on the way in, mirroring every read on this store: the
+            // caller keeps its own leaf and is entitled to keep mutating it.
+            // Retaining it here is how updateParentHashesStreaming ends up
+            // writing parentHash into a DAG the caller still holds.
+            leaves[leaf.hash] = leaf.clone()
         }
     }
 

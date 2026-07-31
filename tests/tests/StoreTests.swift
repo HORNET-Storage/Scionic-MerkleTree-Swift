@@ -60,6 +60,53 @@ final class StoreTests: XCTestCase {
         try store.verify()
     }
 
+    /// Configuring a content store must actually take the payload *out* of the
+    /// metadata store, not copy it into both.
+    ///
+    /// This routes through `DagStore.storeLeaf` instead of splitting by hand the
+    /// way the test above does — that manual split is exactly what was papering
+    /// over the gap. Go's `StoreLeaf` and Rust's `store_leaf` strip here; Swift
+    /// wrote the payload to the content store *and* left it inline, so a store
+    /// configured to keep bytes out of the metadata layer held two copies instead
+    /// of none.
+    func testSeparateContentIsRemovedFromTheMetadataStore() throws {
+        let dag = try makeStoreDag()
+        let leafStore = MemoryLeafStore()
+        let contentStore = MemoryContentStore()
+        let store = DagStore(
+            root: dag.root,
+            leafStore: leafStore,
+            contentStore: contentStore,
+            separateContent: true
+        )
+
+        for leaf in dag.leafs.values {
+            try store.storeLeaf(leaf)
+        }
+
+        // Vacuity guard: with no payload in the fixture there is nothing to
+        // misplace and every assertion below would be free.
+        let carrier = try XCTUnwrap(
+            dag.leafs.values.first { ($0.content?.isEmpty == false) },
+            "the fixture carries no payload, so this test would prove nothing"
+        )
+
+        XCTAssertTrue(
+            try contentStore.hasContent(carrier.hash),
+            "the payload never reached the content store"
+        )
+        let metadataOnly = try XCTUnwrap(try leafStore.retrieveLeaf(carrier.hash))
+        XCTAssertNil(
+            metadataOnly.content,
+            "the payload was written to both stores; the metadata store exists to stay small"
+        )
+
+        // ...and it still reads back whole through the DagStore.
+        let rejoined = try XCTUnwrap(try store.retrieveLeaf(carrier.hash))
+        XCTAssertEqual(rejoined.content, carrier.content)
+        try store.verify()
+    }
+
     func testDagStoreWithOptions() throws {
         let dag = try makeStoreDag()
         let leafStore = MemoryLeafStore()

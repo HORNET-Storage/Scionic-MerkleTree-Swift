@@ -250,15 +250,10 @@ extension Dag {
                 links.append(LinkInfo(hash: link, leaf: childLeaf, itemName: childLeaf.itemName))
             }
 
-            // Sort by numeric basename (extract last path component)
-            links.sort { a, b in
-                let baseA = (a.itemName as NSString).lastPathComponent
-                let baseB = (b.itemName as NSString).lastPathComponent
-                if let numA = Int(baseA), let numB = Int(baseB) {
-                    return numA < numB
-                }
-                return a.itemName < b.itemName
-            }
+            // Order by chunk index. compareChunkItemNames accepts both legacy
+            // path separators, so a Windows-authored name sorts correctly on a
+            // POSIX reader instead of falling back to lexical order.
+            links.sort { compareChunkItemNames($0.itemName, $1.itemName) }
 
             var content = Data()
             for linkInfo in links {

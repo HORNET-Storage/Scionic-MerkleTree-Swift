@@ -20,7 +20,9 @@ Each layer builds on the previous. Start from Layer 1 and work up. A port that p
 - **Layer 4** — Verify your DAG creation from a filesystem produces the identical root hash
 - **Layer 5** — Verify your DAG operations (verify, serialize, transmit, diff, store, partial DAGs) work correctly
 
-The Swift port currently verifies this contract with **250 XCTest tests** (7 of which skip when the optional `spec/vectors` corpus is absent), including the 12 direct cross-compatibility vector tests plus fixture root, true file streaming, store index/cache/update APIs, store streaming, serialization, partial-DAG, batched-transmission, DAG parallel multi-chunk-file, classic-tree parallel proof-update, and clone-independence parity regressions.
+The Swift port currently verifies this contract with **263 XCTest tests**, 7 of which skip when the optional `spec/vectors` corpus is absent. That total includes the 18 direct cross-compatibility vector tests plus fixture root, true file streaming, store index/cache/update APIs, store ownership, store streaming, chunk-reassembly ordering, serialization, partial-DAG, batched-transmission, DAG parallel multi-chunk-file, classic-tree parallel proof-update, and clone-independence parity regressions.
+
+> The cross-compat figure disagreed with itself — 12 here, 18 in the Language Ports table at the end. 18 is the measured value (`swift test --filter CrossCompat`), and both places now say so. Counts in prose drift; where one appears twice, it will eventually be wrong once.
 
 ---
 
@@ -513,8 +515,8 @@ These test files are in `tests/crosscompat_*.go`.
 | Language | Status | Repository |
 |----------|--------|-----------|
 | **Go** | ✅ Reference implementation | [HORNET-Storage/Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) |
-| **Swift** | ✅ Complete (243 tests, 18 direct cross-compat plus fixture/store/index/streaming/transmission/parallel parity) | This repository |
-| **Rust** | 🚧 Layers 1–4 (46 tests: primitives, classic tree, leaf hashing, sequential filesystem DAG). Layer 5 and parallel creation pending. | `Scionic-MerkleTree-Rust` (local, not yet published) |
+| **Swift** | ✅ Complete (263 tests, 0 skipped; 18 direct cross-compat plus fixture/store/index/streaming/transmission/parallel/ownership parity) | This repository |
+| **Rust** | ✅ Complete (109 tests: layers 1–5 including parallel creation and the store-backed half, pinned against Go-generated wire vectors) | `Scionic-MerkleTree-Rust` (local, not yet published) |
 | TypeScript | — | — |
 | Python | — | — |
 | Kotlin | — | — |

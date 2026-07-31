@@ -100,6 +100,106 @@ final class StoreIndexTests: XCTestCase {
         XCTAssertLessThanOrEqual(leafStore.retrieveLeafWithoutContentCalls, 1)
     }
 
+    /// The store index has to land on the same parent the decode path does.
+    ///
+    /// A shared chunk has several parents, so "the" parent of that leaf is only
+    /// well defined if every code path picks the same one. `fromSerializable`
+    /// pins it to the LOWEST parent hash; the store index used to record
+    /// whichever parent BFS reached FIRST. The identical DAG therefore reported a
+    /// different `parentHash` depending on whether it had been decoded or loaded
+    /// from a store — and nothing on the wire ever contradicted that, because
+    /// `parentHash` is absent from `SerializableDagLeaf`.
+    ///
+    /// The root is a FILE leaf on purpose. `buildLeaf` sorts links only for
+    /// DIRECTORY leaves, so listing the higher parent first survives into the
+    /// root's links and BFS genuinely reaches the higher parent first. With a
+    /// directory root the links would be sorted by hash, BFS would arrive at the
+    /// lowest parent anyway, and this test would pass against the very bug it
+    /// exists to catch.
+    ///
+    /// Mirrors Go's `TestStoreIndexPicksTheLowestParentForASharedChunk` and
+    /// Rust's `store_index_picks_the_lowest_parent_for_a_shared_chunk`.
+    func testStoreIndexPicksTheLowestParentForASharedChunk() throws {
+        func build(
+            _ name: String,
+            _ type: LeafType,
+            data: Data? = nil,
+            links: [String] = []
+        ) throws -> DagLeaf {
+            let builder = DagLeafBuilder(name: name)
+            builder.setType(type)
+            if let data = data {
+                builder.setData(data)
+            }
+            for link in links {
+                builder.addLink(link)
+            }
+            return try builder.buildLeaf(additionalData: nil)
+        }
+
+        let shared = try build("0", .chunk, data: Data("shared".utf8))
+        let extraA = try build("1", .chunk, data: Data("extra-a".utf8))
+        let extraB = try build("2", .chunk, data: Data("extra-b".utf8))
+        let parentA = try build("a.bin", .file, links: [shared.hash, extraA.hash])
+        let parentB = try build("b.bin", .file, links: [shared.hash, extraB.hash])
+        let lower = parentA.hash < parentB.hash ? parentA : parentB
+        let higher = parentA.hash < parentB.hash ? parentB : parentA
+        let root = try build("root", .file, links: [higher.hash, lower.hash])
+
+        let leaves = [shared, extraA, extraB, lower, higher, root]
+        let dag = Dag(
+            root: root.hash,
+            leafs: Dictionary(uniqueKeysWithValues: leaves.map { ($0.hash, $0) })
+        )
+
+        // Vacuity guards. Without these the assertions below can hold for
+        // reasons that have nothing to do with the rule under test.
+        XCTAssertEqual(
+            root.links,
+            [higher.hash, lower.hash],
+            "the fixture no longer lists the higher parent first; BFS would reach "
+                + "the lowest parent first and this test would prove nothing"
+        )
+        let sharedParents = leaves.filter { $0.links.contains(shared.hash) }
+        XCTAssertEqual(
+            sharedParents.count,
+            2,
+            "expected the shared chunk to have exactly two parents, got "
+                + "\(sharedParents.map { $0.hash })"
+        )
+
+        let leafStore = MemoryLeafStore()
+        for leaf in leaves {
+            try leafStore.storeLeaf(leaf.clone())
+        }
+        let store = DagStore(root: dag.root, leafStore: leafStore)
+        try store.buildIndex()
+        let index = try XCTUnwrap(store.getIndex())
+
+        XCTAssertEqual(
+            index.parents[shared.hash],
+            lower.hash,
+            "the store index chose the wrong parent for the shared chunk; BFS "
+                + "reaches \(higher.hash) first, which is what it used to record"
+        )
+
+        // The store index and the deserialization path must agree, leaf for leaf.
+        let decoded = try Dag.fromCBOR(dag.toCBOR())
+        for (hash, leaf) in decoded.leafs where hash != decoded.root {
+            XCTAssertEqual(
+                index.parents[hash],
+                leaf.parentHash,
+                "leaf \(hash): the store index and deserialization disagree"
+            )
+        }
+
+        // updateParentHashesStreaming persists whatever the index decided, so it
+        // has to land on the same answer rather than re-deriving its own.
+        try store.updateParentHashesStreaming(batchSize: 2)
+        let stored = try XCTUnwrap(try leafStore.retrieveLeaf(shared.hash))
+        XCTAssertEqual(stored.parentHash, lower.hash)
+    }
+
     private func makeIndexedDag() throws -> Dag {
         let root = try ParityTestHelpers.makeTempDir("store_index")
         try ParityTestHelpers.createDeepHierarchy(at: root)

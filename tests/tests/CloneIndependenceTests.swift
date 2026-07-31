@@ -246,4 +246,102 @@ final class CloneIndependenceTests: XCTestCase {
         XCTAssertEqual(after.links, originalLinks)
         XCTAssertEqual(after.content, originalContent)
     }
+
+    /// ...and every write takes a copy the store owns.
+    ///
+    /// The read half above was fixed first, and alone it is worth less than it
+    /// looks: `storeLeaf` retained the caller's instance, so the caller went on
+    /// holding a live reference into the store and could rewrite stored state
+    /// without ever calling an accessor. Note that the test above has to clone
+    /// before storing for exactly that reason — that manual `.clone()` was
+    /// load-bearing, which is the tell.
+    ///
+    /// Mirrors Go's `TestStoreBoundaryDoesNotAliasCallerLeaves`.
+    func testStoringALeafDoesNotRetainTheCallersInstance() throws {
+        let dag = try buildFixture()
+        let store = MemoryLeafStore()
+        // Deliberately NOT cloned here: handing the store a live instance is the
+        // thing under test.
+        for hash in dag.leafs.keys.sorted() {
+            try store.storeLeaf(dag.leafs[hash]!)
+        }
+
+        let targetHash = try XCTUnwrap(dag.leafs.keys.sorted().first)
+        let caller = try XCTUnwrap(dag.leafs[targetHash])
+        let originalMerkleRoot = caller.classicMerkleRoot
+        let originalLinks = caller.links
+        let originalParentHash = caller.parentHash
+
+        // The caller still owns its leaf and is entitled to keep working on it.
+        caller.classicMerkleRoot = Data(repeating: 0xFF, count: 32)
+        caller.links = ["tampered-link"]
+        caller.parentHash = "tampered"
+
+        let stored = try XCTUnwrap(try store.retrieveLeaf(targetHash))
+        XCTAssertEqual(
+            stored.classicMerkleRoot, originalMerkleRoot,
+            "the caller's edit reached the store: storeLeaf kept the caller's instance"
+        )
+        XCTAssertEqual(stored.links, originalLinks)
+        XCTAssertEqual(stored.parentHash, originalParentHash)
+    }
+
+    /// A `DagStore` built from a DAG shares nothing with that DAG, either way.
+    ///
+    /// Both halves are asserted here on purpose, because each catches a different
+    /// regression and neither catches the other's:
+    ///
+    /// - Editing a caller leaf after construction must not change the store. Only
+    ///   the *write* half stops that.
+    /// - `updateParentHashesStreaming` reads each leaf, assigns `parentHash`, and
+    ///   writes it back; that must not land on the caller's DAG. Only the *read*
+    ///   half stops that — with cloning writes alone, the store is already working
+    ///   on its own instance by then.
+    ///
+    /// Written as one test because they are one property: the boundary holds.
+    func testADagStoreSharesNothingWithTheDagItWasBuiltFrom() throws {
+        let dag = try buildFixture()
+        let parentHashesBefore = dag.leafs.mapValues { $0.parentHash }
+
+        let store = DagStore(dag)
+
+        // Write half: the caller keeps editing its DAG; the store must not notice.
+        let targetHash = try XCTUnwrap(dag.leafs.keys.sorted().first)
+        let callerLeaf = try XCTUnwrap(dag.leafs[targetHash])
+        let originalLinks = callerLeaf.links
+        let originalMerkleRoot = callerLeaf.classicMerkleRoot
+        callerLeaf.links = ["tampered-link"]
+        callerLeaf.classicMerkleRoot = Data(repeating: 0xFF, count: 32)
+
+        let storedTarget = try XCTUnwrap(try store.retrieveLeafWithoutContent(targetHash))
+        XCTAssertEqual(
+            storedTarget.links, originalLinks,
+            "editing the caller's DAG reached inside the store it was built from"
+        )
+        XCTAssertEqual(storedTarget.classicMerkleRoot, originalMerkleRoot)
+
+        // Put the caller's leaf back, so the read half below is judged against an
+        // undamaged DAG rather than against this test's own tampering.
+        callerLeaf.links = originalLinks
+        callerLeaf.classicMerkleRoot = originalMerkleRoot
+
+        // Read half: the store records parents on its own copies only.
+        try store.updateParentHashesStreaming(batchSize: 2)
+        for (hash, leaf) in dag.leafs {
+            XCTAssertEqual(
+                leaf.parentHash, parentHashesBefore[hash],
+                "the store wrote parentHash \(leaf.parentHash) into the caller's DAG leaf \(hash)"
+            )
+        }
+
+        // Vacuity guard: the store must actually have recorded parents on those
+        // copies, or the loop above holds because nothing happened at all.
+        let index = try XCTUnwrap(store.getIndex())
+        let child = try XCTUnwrap(index.leafHashes.first { $0 != dag.root })
+        let storedChild = try XCTUnwrap(try store.retrieveLeafWithoutContent(child))
+        XCTAssertFalse(
+            storedChild.parentHash.isEmpty,
+            "updateParentHashesStreaming recorded nothing, so this proves nothing"
+        )
+    }
 }
