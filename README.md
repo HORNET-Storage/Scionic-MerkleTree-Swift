@@ -99,7 +99,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift.git", from: "2.4.0"),
+    .package(url: "https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift.git", from: "2.4.1"),
 ]
 ```
 

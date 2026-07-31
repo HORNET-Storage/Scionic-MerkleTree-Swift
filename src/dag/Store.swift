@@ -9,9 +9,22 @@ import Foundation
 // MARK: - LeafStore Protocol
 
 /// Protocol for persistent leaf storage backends.
+///
+/// **Ownership contract:** every `retrieve*` method must return a leaf the
+/// caller owns and may mutate freely. `DagLeaf` is a class, so returning a
+/// live reference into the store's own storage lets callers write straight
+/// through into the store -- outside the lock, and outside the
+/// content-preservation merge in `storeLeaf`. `DagStore.retrieveLeaf`
+/// depends on this contract directly: it assigns `leaf.content` on whatever
+/// the store hands back. `MemoryLeafStore` honours it by cloning on every
+/// read; conforming stores must do the same.
 public protocol LeafStore {
     func storeLeaf(_ leaf: DagLeaf) throws
+    /// Returns a leaf the caller owns. Must not alias the store's storage.
     func retrieveLeaf(_ hash: String) throws -> DagLeaf?
+    /// Returns a content-stripped leaf the caller owns. Must not alias the
+    /// store's storage -- stripping content from a live reference would erase
+    /// the stored content as a side effect.
     func retrieveLeafWithoutContent(_ hash: String) throws -> DagLeaf?
     func hasLeaf(_ hash: String) throws -> Bool
     func deleteLeaf(_ hash: String) throws
@@ -28,6 +41,7 @@ public protocol ContentStore {
 /// Optional batch operations for leaf stores.
 public protocol BatchLeafStore: LeafStore {
     func storeLeaves(_ leaves: [DagLeaf]) throws
+    /// Returns leaves the caller owns. Must not alias the store's storage.
     func retrieveLeaves(_ hashes: [String]) throws -> [String: DagLeaf]
 }
 
@@ -1018,10 +1032,16 @@ public class MemoryLeafStore: LeafStore, BatchLeafStore, LeafCounter, LeafEnumer
         return Array(leaves.keys)
     }
 
+    /// Returns every stored leaf as an owned copy.
+    ///
+    /// Clones for the same reason every other read on this store clones:
+    /// `DagLeaf` is a class, so handing out the stored instance would let a
+    /// caller mutate the store's contents in place -- outside the lock, and
+    /// outside the content-preservation merge in `storeLeafUnlocked`.
     public func getAllLeaves() -> [String: DagLeaf] {
         lock.lock(); defer { lock.unlock() }
         var result: [String: DagLeaf] = [:]
-        for (k, v) in leaves { result[k] = v }
+        for (k, v) in leaves { result[k] = v.clone() }
         return result
     }
 }

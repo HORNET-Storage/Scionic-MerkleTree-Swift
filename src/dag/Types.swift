@@ -143,7 +143,19 @@ public class DagLeaf {
         links.append(hash)
     }
 
-    /// Creates a deep copy of this leaf.
+    /// Creates a fully independent copy of this leaf.
+    ///
+    /// Unlike Go's `Clone()` -- which shares the `Content` backing array and
+    /// documents that callers must reassign it rather than write through it --
+    /// every field copied here is a value type: `Data`, `[String]`,
+    /// `[String: String]`, and `[String: ClassicTreeBranch]` (whose `Proof`
+    /// is itself a struct of `[Data]` + `UInt32`). Copy-on-write makes the
+    /// copy both free and safe: nothing written to the copy can reach the
+    /// original, and no bytes are duplicated until someone actually writes.
+    ///
+    /// `merkleTree` and `leafMap` are deliberately left nil. They are
+    /// transient derived state rebuilt from `links` on demand, and Go marks
+    /// the same two fields `json:"-"` and omits them from `Clone()` too.
     public func clone() -> DagLeaf {
         let c = DagLeaf()
         c.hash = hash

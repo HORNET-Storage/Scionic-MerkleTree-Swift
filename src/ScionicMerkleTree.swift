@@ -13,5 +13,9 @@
 //   testutil/    — Fixture builders used by parity tests
 //   internal/    — CBOR encoding, CID generation, base encodings
 
-/// Library version matching the Go v2 module
-public let version = "2.0.0"
+/// Library version, mirroring the Go release this port reproduces byte for byte.
+///
+/// This is a parity claim rather than an independent release history — see
+/// `PARITY_SPEC.md`. It had silently drifted to `2.0.0` while the package was
+/// tagged `v2.4.0`; keep it in step with the tag.
+public let version = "2.4.1"
