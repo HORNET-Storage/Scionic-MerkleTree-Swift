@@ -20,7 +20,7 @@ Each layer builds on the previous. Start from Layer 1 and work up. A port that p
 - **Layer 4** — Verify your DAG creation from a filesystem produces the identical root hash
 - **Layer 5** — Verify your DAG operations (verify, serialize, transmit, diff, store, partial DAGs) work correctly
 
-The Swift port currently verifies this contract with **266 XCTest tests**, none of which skip — the `spec/vectors` corpus is committed to this repository, and its absence now fails rather than skipping. That total includes the 18 direct cross-compatibility vector tests plus fixture root, true file streaming, store index/cache/update APIs, store ownership, store streaming, chunk-reassembly ordering, serialization, partial-DAG, batched-transmission, DAG parallel multi-chunk-file, classic-tree parallel proof-update, wire-map ordering, and clone-independence parity regressions.
+The Swift port currently verifies this contract with **269 XCTest tests**, none of which skip — the `spec/vectors` corpus is committed to this repository, and its absence now fails rather than skipping. That total includes the 18 direct cross-compatibility vector tests plus fixture root, true file streaming, store index/cache/update APIs, store ownership, store streaming, chunk-reassembly ordering, serialization, partial-DAG, batched-transmission, DAG parallel multi-chunk-file, classic-tree parallel proof-update, wire-map ordering, wire shape, and clone-independence parity regressions.
 
 > The cross-compat figure disagreed with itself — 12 here, 18 in the Language Ports table at the end. 18 is the measured value (`swift test --filter CrossCompat`), and both places now say so. Counts in prose drift; where one appears twice, it will eventually be wrong once.
 
@@ -90,8 +90,17 @@ Verify these CBOR encodings:
 >
 > Ordering there is **length-first, then bytewise** on the UTF-8 key — RFC 8949's
 > rule for text keys. A port that sorts the struct fields too will fail
-> `CrossCompatWireTests`; a port that sorts nothing will fail the spec-vector byte
-> comparison. `stored_proofs` and `proofs` are omitted entirely when empty.
+> `WireShapeTests` and `CrossCompatWireTests`; a port that sorts nothing will fail
+> the spec-vector byte comparison.
+>
+> `stored_proofs` and `proofs` are omitted entirely when empty, and that omission
+> has its own guard (`WireShapeTests.testOmitEmptyStillDropsEmptyProofMaps`, and
+> the same test in Go and Rust) because it is a *separate* failure mode from field
+> order. Both regressions actually shipped, and neither guard catches the other's:
+> mutating field order leaves the omitempty test green, and emitting an empty
+> `stored_proofs` on every leaf leaves every key-order test green — including
+> `CrossCompatWireTests`, whose leaf-key helper adds `stored_proofs` to the
+> expected list whenever it sees it.
 >
 > Do not reuse `SortMapForVerification`'s comparator (plain lexicographic on the
 > decoded string) for these maps. That one orders a CBOR *array* of key/value
@@ -544,8 +553,8 @@ These test files are in `tests/crosscompat_*.go`.
 | Language | Status | Repository |
 |----------|--------|-----------|
 | **Go** | ✅ Reference implementation | [HORNET-Storage/Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) |
-| **Swift** | ✅ Complete (266 tests, 0 skipped; 18 direct cross-compat plus fixture/store/index/streaming/transmission/parallel/ownership/wire-ordering parity) | This repository |
-| **Rust** | ✅ Complete (111 tests: layers 1–5 including parallel creation and the store-backed half, pinned against Go-generated wire vectors) | `Scionic-MerkleTree-Rust` (local, not yet published) |
+| **Swift** | ✅ Complete (269 tests, 0 skipped; 18 direct cross-compat plus fixture/store/index/streaming/transmission/parallel/ownership/wire-ordering/wire-shape parity) | This repository |
+| **Rust** | ✅ Complete (114 tests: layers 1–5 including parallel creation and the store-backed half, pinned against Go-generated wire vectors) | `Scionic-MerkleTree-Rust` (local, not yet published) |
 | TypeScript | — | — |
 | Python | — | — |
 | Kotlin | — | — |
