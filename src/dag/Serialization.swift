@@ -192,14 +192,16 @@ extension Dag {
         let cborEncoder = CBOREncoder()
         let serializable = toSerializable()
 
+        // Leafs is a genuine dynamic map, so it sorts. The two pairs around it are
+        // struct fields (Go: SerializableDag) and must stay in declaration order.
         var leafPairs: [(String, CBORValue)] = []
-        for (hash, sLeaf) in serializable.leafs.sorted(by: { $0.key < $1.key }) {
+        for (hash, sLeaf) in serializable.leafs {
             leafPairs.append((hash, serializableDagLeafToCBOR(sLeaf)))
         }
 
         return cborEncoder.encodeMap([
             ("Root", .textString(serializable.root)),
-            ("Leafs", .map(CBOROrderedMap(leafPairs))),
+            ("Leafs", CBOREncoder.sortedCBORMap(leafPairs)),
         ])
     }
 
@@ -253,12 +255,12 @@ func serializableDagLeafToCBOR(_ sLeaf: SerializableDagLeaf) -> CBORValue {
         ("AdditionalData", encodeSortedMapToCBOR(sLeaf.additionalData)),
     ]
 
+    // stored_proofs is omitted entirely when empty -- Go tags it `omitempty`, and
+    // both other ports omit it too. Emitting an empty map here would add a key to
+    // every leaf in every full DAG.
     if let sp = sLeaf.storedProofs, !sp.isEmpty {
-        var proofPairs: [(String, CBORValue)] = []
-        for (k, v) in sp.sorted(by: { $0.key < $1.key }) {
-            proofPairs.append((k, serializableProofToCBOR(v)))
-        }
-        pairs.append(("stored_proofs", .map(CBOROrderedMap(proofPairs))))
+        let proofPairs = sp.map { ($0.key, serializableProofToCBOR($0.value)) }
+        pairs.append(("stored_proofs", CBOREncoder.sortedCBORMap(proofPairs)))
     }
 
     return .map(CBOROrderedMap(pairs))
@@ -275,11 +277,9 @@ func serializableProofToCBOR(_ sp: SerializableProof) -> CBORValue {
 }
 
 func encodeSortedMapToCBOR(_ m: [String: String]) -> CBORValue {
-    if m.isEmpty {
-        return .map(CBOROrderedMap([]))
-    }
-    let sorted = m.sorted { $0.key < $1.key }
-    return .map(CBOROrderedMap(sorted.map { ($0.key, CBORValue.textString($0.value)) }))
+    // AdditionalData is the one wire map with arbitrary, mixed-length keys, so it
+    // is the only place the length-first rule is observable at all.
+    return CBOREncoder.sortedCBORMap(m.map { ($0.key, CBORValue.textString($0.value)) })
 }
 
 // MARK: - CBOR Decoding Helpers
@@ -398,10 +398,8 @@ extension TransmissionPacket {
             ("ParentHash", .textString(s.parentHash)),
         ]
         if let sp = s.proofs, !sp.isEmpty {
-            let proofPairs = sp
-                .sorted(by: { $0.key < $1.key })
-                .map { ($0.key, serializableProofToCBOR($0.value)) }
-            pairs.append(("proofs", .map(CBOROrderedMap(proofPairs))))
+            let proofPairs = sp.map { ($0.key, serializableProofToCBOR($0.value)) }
+            pairs.append(("proofs", CBOREncoder.sortedCBORMap(proofPairs)))
         }
         return cborEncoder.encodeMap(pairs)
     }
@@ -455,13 +453,11 @@ extension BatchedTransmissionPacket {
         let s = toSerializable()
         let encoder = CBOREncoder()
         let leavesValue = CBORValue.array(s.leaves.map { serializableDagLeafToCBOR($0) })
-        let relationshipPairs = s.relationships
-            .sorted { $0.key < $1.key }
-            .map { ($0.key, CBORValue.textString($0.value)) }
+        let relationshipPairs = s.relationships.map { ($0.key, CBORValue.textString($0.value)) }
 
         return encoder.encodeMap([
             ("Leaves", leavesValue),
-            ("Relationships", .map(CBOROrderedMap(relationshipPairs))),
+            ("Relationships", CBOREncoder.sortedCBORMap(relationshipPairs)),
             ("PacketIndex", s.packetIndex >= 0 ? .unsignedInt(UInt64(s.packetIndex)) : .negativeInt(Int64(s.packetIndex))),
             ("TotalPackets", s.totalPackets >= 0 ? .unsignedInt(UInt64(s.totalPackets)) : .negativeInt(Int64(s.totalPackets))),
         ])

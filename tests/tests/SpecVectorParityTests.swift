@@ -158,10 +158,20 @@ final class SpecVectorParityTests: XCTestCase {
     /// is not merely unspecified but per-process randomized by seeded hashing.
     func testManifestFullDagCBORIsDeterministic() throws {
         for vectorCase in try loadedManifest().cases {
-            let dag = try Dag.fromCBOR(try readVector(vectorCase.fullDag))
+            let committed = try readVector(vectorCase.fullDag)
+            let dag = try Dag.fromCBOR(committed)
 
             let first = try dag.toCBOR()
             let second = try dag.toCBOR()
+
+            // Cross-port byte parity: Swift must reproduce, byte for byte, the
+            // envelope Go committed. This is strictly stronger than encoding the
+            // same DAG twice -- a port could be perfectly self-consistent and
+            // still disagree with Go on field order.
+            XCTAssertEqual(
+                first, committed,
+                "\(vectorCase.name): re-encoded DAG differs from the bytes Go committed"
+            )
             XCTAssertEqual(
                 first, second,
                 "\(vectorCase.name): encoding the same DAG twice produced different bytes"
@@ -260,10 +270,16 @@ final class SpecVectorParityTests: XCTestCase {
             let receiver = Dag()
 
             for packetPath in vectorCase.transmissionPackets {
-                let packet = try TransmissionPacket.fromCBOR(try readVector(packetPath))
+                let committed = try readVector(packetPath)
+                let packet = try TransmissionPacket.fromCBOR(committed)
 
                 let first = try packet.toCBOR()
                 let second = try packet.toCBOR()
+
+                XCTAssertEqual(
+                    first, committed,
+                    "\(vectorCase.name): re-encoded \(packetPath) differs from the bytes Go committed"
+                )
                 XCTAssertEqual(
                     first, second,
                     "\(vectorCase.name): encoding \(packetPath) twice produced different bytes"
@@ -291,10 +307,16 @@ final class SpecVectorParityTests: XCTestCase {
             let receiver = Dag()
 
             for batchPath in vectorCase.batchedPackets {
-                let batch = try BatchedTransmissionPacket.fromCBOR(try readVector(batchPath))
+                let committed = try readVector(batchPath)
+                let batch = try BatchedTransmissionPacket.fromCBOR(committed)
 
                 let first = try batch.toCBOR()
                 let second = try batch.toCBOR()
+
+                XCTAssertEqual(
+                    first, committed,
+                    "\(vectorCase.name): re-encoded \(batchPath) differs from the bytes Go committed"
+                )
                 XCTAssertEqual(
                     first, second,
                     "\(vectorCase.name): encoding \(batchPath) twice produced different bytes"

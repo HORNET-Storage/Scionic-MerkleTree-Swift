@@ -6,7 +6,7 @@ A comprehensive Swift port of [Scionic-Merkle-Tree](https://github.com/HORNET-St
 
 ## What’s Ported
 
-This is a near-complete port of the Go library. **20 source files, 263 tests.** (`swift test` on Windows/Swift 6.3.1: 263 executed, **0 skipped**, 0 failures.)
+This is a near-complete port of the Go library. **20 source files, 266 tests.** (`swift test` on Windows/Swift 6.3.1: 266 executed, **0 skipped**, 0 failures.)
 
 > Seven of those tests used to skip rather than run. They read a `spec/vectors`
 > corpus resolved from a sibling Go checkout, which was present on no machine, so

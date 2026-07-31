@@ -160,6 +160,48 @@ public struct CBOREncoder {
         return encode(.map(CBOROrderedMap(pairs)))
     }
 
+    /// Builds a CBOR map whose keys are in RFC 8949 core-deterministic order.
+    ///
+    /// Applied PER MAP, at the few sites that build a genuinely dynamic map --
+    /// `Leafs`, `AdditionalData`, `stored_proofs`, `proofs`, `Relationships` --
+    /// and NEVER to the struct-shaped maps around them.
+    ///
+    /// That distinction is invisible in Swift, where a struct and a map are both
+    /// `.map(CBOROrderedMap)`, but it is load-bearing on the wire. Go's wire types
+    /// are structs with map FIELDS: fxamacker emits struct fields in declaration
+    /// order and only randomizes map iteration, so only the maps were ever
+    /// unordered. A blanket sort over the encoded tree shipped here briefly and
+    /// reordered the struct fields too, which `CrossCompatWireTests` caught against
+    /// golden bytes captured from a real deployed v2.2.6 build:
+    ///
+    ///     expected [Leaves, Relationships, PacketIndex, TotalPackets]  (declaration)
+    ///     got      [Leaves, PacketIndex, TotalPackets, Relationships]  (sorted)
+    ///
+    /// RFC 8949 orders map keys by their ENCODED bytes, bytewise. For text keys
+    /// that reduces to length-first, then bytewise on the UTF-8 -- and it reduces
+    /// exactly, at every boundary, because the encoded head grows monotonically
+    /// with length: a key shorter than 24 bytes starts with `0x60 + len` (at most
+    /// `0x77`), one of 24...255 bytes starts with `0x78`, one of 256...65535 with
+    /// `0x79`. A shorter key therefore always has a smaller leading byte, so
+    /// comparing `(count, bytes)` and comparing encoded forms never disagree.
+    ///
+    /// Note this is NOT the same comparator as `sortMapByKeys` /
+    /// `sortMapForVerification`, which order by the decoded string. Those feed the
+    /// CID preimage, where AdditionalData is a CBOR *array* of key/value structs --
+    /// map-key rules never apply to it, and its order is frozen into every CID ever
+    /// minted. Do not unify the two.
+    public static func sortedCBORMap(_ pairs: [(String, CBORValue)]) -> CBORValue {
+        let sorted = pairs.sorted { left, right in
+            let leftBytes = Array(left.0.utf8)
+            let rightBytes = Array(right.0.utf8)
+            if leftBytes.count != rightBytes.count {
+                return leftBytes.count < rightBytes.count
+            }
+            return leftBytes.lexicographicallyPrecedes(rightBytes)
+        }
+        return .map(CBOROrderedMap(sorted))
+    }
+
     // MARK: - Private Encoding
 
     private func encodeValue(_ value: CBORValue, into data: inout Data) {
