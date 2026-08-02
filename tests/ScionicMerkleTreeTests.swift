@@ -17,6 +17,6 @@ final class ScionicMerkleTreeTests: XCTestCase {
         // v2.3 and v2.4 tags: the test pinned the drift instead of catching it, so
         // the only thing guarding the version agreed with the bug. Bump it in the
         // same commit as the tag.
-        XCTAssertEqual(ScionicMerkleTree.version, "2.4.1")
+        XCTAssertEqual(ScionicMerkleTree.version, "2.4.2")
     }
 }
