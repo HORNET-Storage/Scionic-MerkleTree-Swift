@@ -167,9 +167,10 @@ public struct CBOREncoder {
 
     /// Encodes a `CBORValue` to its CBOR binary representation.
     public func encode(_ value: CBORValue) -> Data {
-        var data = Data()
-        encodeValue(value, into: &data)
-        return data
+        var buffer = [UInt8]()
+        buffer.reserveCapacity(CBOREncoder.encodedSize(value))
+        encodeValue(value, into: &buffer)
+        return Data(buffer)
     }
 
     /// Encodes an ordered map (Go struct equivalent) to CBOR.
@@ -244,46 +245,48 @@ public struct CBOREncoder {
 
     // MARK: - Private Encoding
 
-    private func encodeValue(_ value: CBORValue, into data: inout Data) {
+    private func encodeValue(_ value: CBORValue, into buffer: inout [UInt8]) {
         switch value {
         case .unsignedInt(let v):
-            encodeUnsignedInt(v, majorType: .unsignedInt, into: &data)
+            encodeUnsignedInt(v, majorType: .unsignedInt, into: &buffer)
 
         case .negativeInt(let v):
             // CBOR negative int encoding: value = -1 - n, so n = -1 - value
             let n = UInt64(bitPattern: -1 - v)
-            encodeUnsignedInt(n, majorType: .negativeInt, into: &data)
+            encodeUnsignedInt(n, majorType: .negativeInt, into: &buffer)
 
         case .byteString(let bytes):
-            encodeUnsignedInt(UInt64(bytes.count), majorType: .byteString, into: &data)
-            data.append(bytes)
+            encodeUnsignedInt(UInt64(bytes.count), majorType: .byteString, into: &buffer)
+            buffer.append(contentsOf: bytes)
 
         case .textString(let str):
-            let utf8 = Data(str.utf8)
-            encodeUnsignedInt(UInt64(utf8.count), majorType: .textString, into: &data)
-            data.append(utf8)
+            let utf8 = str.utf8
+            encodeUnsignedInt(UInt64(utf8.count), majorType: .textString, into: &buffer)
+            buffer.append(contentsOf: utf8)
 
         case .array(let items):
-            encodeUnsignedInt(UInt64(items.count), majorType: .array, into: &data)
+            encodeUnsignedInt(UInt64(items.count), majorType: .array, into: &buffer)
             for item in items {
-                encodeValue(item, into: &data)
+                encodeValue(item, into: &buffer)
             }
 
         case .map(let orderedMap):
-            encodeUnsignedInt(UInt64(orderedMap.pairs.count), majorType: .map, into: &data)
+            encodeUnsignedInt(UInt64(orderedMap.pairs.count), majorType: .map, into: &buffer)
             for pair in orderedMap.pairs {
-                encodeValue(.textString(pair.key), into: &data)
-                encodeValue(pair.value, into: &data)
+                let keyUTF8 = pair.key.utf8
+                encodeUnsignedInt(UInt64(keyUTF8.count), majorType: .textString, into: &buffer)
+                buffer.append(contentsOf: keyUTF8)
+                encodeValue(pair.value, into: &buffer)
             }
 
         case .null:
-            data.append(0xf6)
+            buffer.append(0xf6)
 
         case .bool(let v):
-            data.append(v ? 0xf5 : 0xf4)
+            buffer.append(v ? 0xf5 : 0xf4)
 
         case .undefined:
-            data.append(0xf7)
+            buffer.append(0xf7)
         }
     }
 
@@ -294,28 +297,74 @@ public struct CBOREncoder {
     ///   - 256-65535:    3 bytes  `[major | 25, value_hi, value_lo]`
     ///   - 65536-2^32-1: 5 bytes  `[major | 26, 4 bytes big-endian]`
     ///   - 2^32-2^64-1:  9 bytes  `[major | 27, 8 bytes big-endian]`
-    private func encodeUnsignedInt(_ value: UInt64, majorType: CBORMajorType, into data: inout Data) {
+    private func encodeUnsignedInt(_ value: UInt64, majorType: CBORMajorType, into buffer: inout [UInt8]) {
         let major = majorType.rawValue << 5
 
         if value < 24 {
-            data.append(major | UInt8(value))
+            buffer.append(major | UInt8(value))
         } else if value <= UInt8.max {
-            data.append(major | 24)
-            data.append(UInt8(value))
+            buffer.append(major | 24)
+            buffer.append(UInt8(value))
         } else if value <= UInt16.max {
-            data.append(major | 25)
-            appendBigEndian(UInt16(value), into: &data)
+            buffer.append(major | 25)
+            appendBigEndian(UInt16(value), into: &buffer)
         } else if value <= UInt32.max {
-            data.append(major | 26)
-            appendBigEndian(UInt32(value), into: &data)
+            buffer.append(major | 26)
+            appendBigEndian(UInt32(value), into: &buffer)
         } else {
-            data.append(major | 27)
-            appendBigEndian(value, into: &data)
+            buffer.append(major | 27)
+            appendBigEndian(value, into: &buffer)
         }
     }
 
-    private func appendBigEndian<T: FixedWidthInteger>(_ value: T, into data: inout Data) {
-        withUnsafeBytes(of: value.bigEndian) { data.append(contentsOf: $0) }
+    private func appendBigEndian<T: FixedWidthInteger>(_ value: T, into buffer: inout [UInt8]) {
+        withUnsafeBytes(of: value.bigEndian) { buffer.append(contentsOf: $0) }
+    }
+
+    // MARK: - Size Precomputation
+
+    /// Exact encoded byte count for `value` — mirrors `encodeValue` case by case
+    /// so `encode` can size its buffer in one allocation. A mismatch cannot
+    /// corrupt output (capacity is only a hint), but keep the two in sync so the
+    /// win stays real.
+    static func encodedSize(_ value: CBORValue) -> Int {
+        switch value {
+        case .unsignedInt(let v):
+            return headerSize(v)
+        case .negativeInt(let v):
+            return headerSize(UInt64(bitPattern: -1 - v))
+        case .byteString(let bytes):
+            return headerSize(UInt64(bytes.count)) + bytes.count
+        case .textString(let str):
+            let count = str.utf8.count
+            return headerSize(UInt64(count)) + count
+        case .array(let items):
+            var size = headerSize(UInt64(items.count))
+            for item in items {
+                size += encodedSize(item)
+            }
+            return size
+        case .map(let orderedMap):
+            var size = headerSize(UInt64(orderedMap.pairs.count))
+            for pair in orderedMap.pairs {
+                let keyCount = pair.key.utf8.count
+                size += headerSize(UInt64(keyCount)) + keyCount
+                size += encodedSize(pair.value)
+            }
+            return size
+        case .null, .bool, .undefined:
+            return 1
+        }
+    }
+
+    /// Size of the head (initial byte plus length payload) for a value or
+    /// length `value` — the shortest-form ladder `encodeUnsignedInt` walks.
+    private static func headerSize(_ value: UInt64) -> Int {
+        if value < 24 { return 1 }
+        if value <= UInt8.max { return 2 }
+        if value <= UInt16.max { return 3 }
+        if value <= UInt32.max { return 5 }
+        return 9
     }
 }
 

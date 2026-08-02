@@ -4,7 +4,6 @@
 // Accepts a map of key -> DataBlock (not just an array).
 
 import Foundation
-import Crypto
 
 // MARK: - Errors
 
@@ -98,6 +97,11 @@ public class MerkleTree {
     var hashFunc: MerkleHashFunc!
     var concatFunc: (Data, Data) -> Data = concatHash
 
+    /// True when the tree was built with the default SHA-256 hash function,
+    /// letting hot paths stream sibling pairs into one hasher instead of
+    /// allocating an intermediate concatenated `Data` per pair.
+    var usesDefaultHashPipeline = false
+
     public init(config: MerkleTreeConfig = MerkleTreeConfig()) {
         self.config = config
     }
@@ -122,5 +126,21 @@ func concatSortHash(_ b1: Data, _ b2: Data) -> Data {
 // MARK: - Default Hash
 
 public func defaultHashFunc(_ data: Data) throws -> Data {
-    return Data(SHA256.hash(data: data))
+    return sha256Digest(data)
+}
+
+/// Hashes a sibling pair with the default SHA-256 pipeline, streaming both
+/// halves into one hasher instead of concatenating them into a temporary
+/// buffer first. Byte-identical to `defaultHashFunc(concatFunc(b1, b2))` for
+/// both the sorted (`concatSortHash`) and plain (`concatHash`) concat orders.
+func defaultPairHash(_ b1: Data, _ b2: Data, sortPairs: Bool) -> Data {
+    var hasher = SHA256Hasher()
+    if sortPairs && !b1.lexicographicallyPrecedes(b2) {
+        hasher.update(b2)
+        hasher.update(b1)
+    } else {
+        hasher.update(b1)
+        hasher.update(b2)
+    }
+    return hasher.finalize()
 }

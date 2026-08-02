@@ -8,7 +8,6 @@
 //   - MerkleTree.getIndexForKey(key) — look up leaf index by key
 
 import Foundation
-import Crypto
 
 private final class ParallelMerkleState<Element> {
     private var values: [Element?]
@@ -132,6 +131,7 @@ extension MerkleTree {
 
         // Resolve hash function
         tree.hashFunc = cfg.hashFunc ?? defaultHashFunc
+        tree.usesDefaultHashPipeline = (cfg.hashFunc == nil)
 
         // Resolve concat function
         tree.concatFunc = cfg.sortSiblingPairs ? concatSortHash : concatHash
@@ -221,7 +221,7 @@ extension MerkleTree {
             var parents = [Data](repeating: Data(), count: parentCount)
             for pairIndex in 0..<parentCount {
                 let idx = pairIndex << 1
-                parents[pairIndex] = try hashFunc(concatFunc(buffer[idx], buffer[idx + 1]))
+                parents[pairIndex] = try pairHash(buffer[idx], buffer[idx + 1])
             }
             return parents
         }
@@ -239,7 +239,7 @@ extension MerkleTree {
                 while pairIndex < parentCount {
                     let idx = pairIndex << 1
                     do {
-                        let parent = try self.hashFunc(self.concatFunc(buffer[idx], buffer[idx + 1]))
+                        let parent = try self.pairHash(buffer[idx], buffer[idx + 1])
                         state.set(parent, at: pairIndex)
                     } catch {
                         state.record(error)
@@ -272,6 +272,16 @@ extension MerkleTree {
         return try hashFunc(blockBytes)
     }
 
+    /// Hashes a sibling pair. On the default pipeline this streams both halves
+    /// into one SHA-256 hasher (no concatenated temporary); with a custom hash
+    /// function it falls back to the configured hash/concat pipeline.
+    private func pairHash(_ b1: Data, _ b2: Data) throws -> Data {
+        if usesDefaultHashPipeline {
+            return defaultPairHash(b1, b2, sortPairs: config.sortSiblingPairs)
+        }
+        return try hashFunc(concatFunc(b1, b2))
+    }
+
     // MARK: - Proof Generation
 
     private func initProofs() {
@@ -296,14 +306,14 @@ extension MerkleTree {
         for step in 1..<depth {
             let parentCount = bufferLength >> 1
             for idx in stride(from: 0, to: bufferLength, by: 2) {
-                buffer[idx >> 1] = try hashFunc(concatFunc(buffer[idx], buffer[idx + 1]))
+                buffer[idx >> 1] = try pairHash(buffer[idx], buffer[idx + 1])
             }
             bufferLength = parentCount
             (buffer, bufferLength) = fixOddLength(buffer, bufferLength)
             updateProofs(buffer: buffer, bufferLength: bufferLength, step: step)
         }
 
-        root = try hashFunc(concatFunc(buffer[0], buffer[1]))
+        root = try pairHash(buffer[0], buffer[1])
     }
 
     private func generateProofsInParallel(buffer: [Data], bufferLength: Int) throws {
@@ -322,7 +332,7 @@ extension MerkleTree {
                 }
             } else {
                 for idx in stride(from: 0, to: workingLength, by: 2) {
-                    workingBuffer[idx >> 1] = try hashFunc(concatFunc(workingBuffer[idx], workingBuffer[idx + 1]))
+                    workingBuffer[idx >> 1] = try pairHash(workingBuffer[idx], workingBuffer[idx + 1])
                 }
             }
 
@@ -331,7 +341,7 @@ extension MerkleTree {
             updateProofsInParallel(buffer: workingBuffer, bufferLength: workingLength, step: step, state: proofState)
         }
 
-        root = try hashFunc(concatFunc(workingBuffer[0], workingBuffer[1]))
+        root = try pairHash(workingBuffer[0], workingBuffer[1])
         proofs = proofState.result()
     }
 
@@ -356,16 +366,14 @@ extension MerkleTree {
             } else {
                 nodes[i + 1] = [Data](repeating: Data(), count: parentCount)
                 for j in stride(from: 0, to: bufferLength, by: 2) {
-                    nodes[i + 1][j >> 1] = try hashFunc(concatFunc(nodes[i][j], nodes[i][j + 1]))
+                    nodes[i + 1][j >> 1] = try pairHash(nodes[i][j], nodes[i][j + 1])
                 }
             }
             let newLen = nodes[i + 1].count
             (nodes[i + 1], bufferLength) = fixOddLength(nodes[i + 1], newLen)
         }
 
-        root = try hashFunc(concatFunc(
-            nodes[depth - 1][0], nodes[depth - 1][1]
-        ))
+        root = try pairHash(nodes[depth - 1][0], nodes[depth - 1][1])
     }
     // MARK: - Proof Update
 
@@ -474,6 +482,9 @@ extension MerkleTree {
         let cfg = config ?? MerkleTreeConfig()
         let hash: MerkleHashFunc = cfg.hashFunc ?? defaultHashFunc
         let concat: (Data, Data) -> Data = cfg.sortSiblingPairs ? concatSortHash : concatHash
+        let pair: (Data, Data) throws -> Data = cfg.hashFunc == nil
+            ? { defaultPairHash($0, $1, sortPairs: cfg.sortSiblingPairs) }
+            : { try hash(concat($0, $1)) }
 
         // Convert data block to leaf hash
         let blockBytes = try dataBlock.serialize()
@@ -488,9 +499,9 @@ extension MerkleTree {
         var path = proof.path
         for sibling in proof.siblings {
             if path & 1 == 1 {
-                result = try hash(concat(result, sibling))
+                result = try pair(result, sibling)
             } else {
-                result = try hash(concat(sibling, result))
+                result = try pair(sibling, result)
             }
             path >>= 1
         }

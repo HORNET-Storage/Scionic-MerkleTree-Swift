@@ -3,7 +3,6 @@
 // Ported from dag/utils.go.
 
 import Foundation
-import Crypto
 
 // MARK: - KeyValue (for CBOR serialization)
 
@@ -149,7 +148,7 @@ func verifyLeafContentHash(_ leaf: DagLeaf) throws {
     guard let contentHash = leaf.contentHash, !contentHash.isEmpty else {
         throw DagError.brokenDag("leaf \(leaf.hash) has content but no content hash to verify against")
     }
-    let computed = Data(SHA256.hash(data: content))
+    let computed = sha256Digest(content)
     guard computed == contentHash else {
         throw DagError.brokenDag("leaf \(leaf.hash) content does not match its content hash")
     }

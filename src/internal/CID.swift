@@ -12,7 +12,6 @@
 //   - Also supports: 'z' prefix + base58btc
 
 import Foundation
-import Crypto
 
 // MARK: - Constants
 
@@ -87,8 +86,7 @@ public struct CID: Equatable, Hashable {
     /// - Parameter data: The data to hash (typically CBOR-serialized leaf fields).
     /// - Returns: A new CID containing the SHA-256 digest.
     public static func generate(from data: Data) -> CID {
-        let hash = SHA256.hash(data: data)
-        return CID(digest: Data(hash))
+        return CID(digest: sha256Digest(data))
     }
 
     // MARK: - Binary Encoding

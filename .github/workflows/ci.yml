@@ -1,0 +1,59 @@
+name: CI
+
+# Three jobs, one per SHA-256 backend configuration of src/internal/SHA256Backend.swift:
+#   - Linux   -> swift-crypto with BoringSSL's ELF assembly (the #else branch)
+#   - macOS   -> swift-crypto re-exporting CryptoKit (the #else branch, Apple side —
+#                the same hash path iOS uses; this is the closest CI gets to the
+#                production target without a device)
+#   - Windows -> CNG/BCrypt (the #if os(Windows) branch)
+# The suite's golden-byte and spec-vector tests fail loudly if any backend
+# produces a single different byte, so green here means byte parity on all three.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux — swift-crypto (BoringSSL)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Swift 6.3.1 (swift.org tarball)
+        run: |
+          curl -sL --retry 3 -o /tmp/swift.tar.gz "https://download.swift.org/swift-6.3.1-release/ubuntu2404/swift-6.3.1-RELEASE/swift-6.3.1-RELEASE-ubuntu24.04.tar.gz"
+          mkdir -p "$HOME/swift"
+          tar -xzf /tmp/swift.tar.gz -C "$HOME/swift" --strip-components=1
+          echo "$HOME/swift/usr/bin" >> "$GITHUB_PATH"
+      - run: swift --version
+      - run: swift test
+
+  macos:
+    name: macOS — CryptoKit (iOS-relevant hash path)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Xcode's bundled Swift; the package declares swift-tools-version 5.9,
+      # so any current macOS runner image can build it. Version drift from the
+      # pinned 6.3.1 elsewhere is deliberate: this job exercises the toolchain
+      # Apple platform builds actually use.
+      - run: swift --version
+      - run: swift test
+
+  windows:
+    name: Windows — CNG/BCrypt
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: compnerd/gha-setup-swift@main
+        with:
+          swift-version: swift-6.3.1-release
+          swift-build: 6.3.1-RELEASE
+          cache: true
+      - run: swift --version
+      - run: swift test

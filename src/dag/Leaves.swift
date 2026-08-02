@@ -10,7 +10,6 @@
 //   4. Store CID as base32lower string (the leaf's "hash")
 
 import Foundation
-import Crypto
 
 // MARK: - DagLeafBuilder Extensions (Build Leaf)
 
@@ -53,8 +52,7 @@ extension DagLeafBuilder {
 
         var contentHashBytes: Data? = nil
         if let d = data {
-            let hash = SHA256.hash(data: d)
-            contentHashBytes = Data(hash)
+            contentHashBytes = sha256Digest(d)
         }
 
         let additionalDataCBOR: CBORValue
@@ -150,8 +148,7 @@ extension DagLeafBuilder {
 
         var contentHashBytes: Data? = nil
         if let d = data {
-            let hash = SHA256.hash(data: d)
-            contentHashBytes = Data(hash)
+            contentHashBytes = sha256Digest(d)
         }
 
         let sortedAdditionalData = sortMapByKeys(additionalData)
@@ -231,7 +228,7 @@ extension DagLeaf {
     /// Mirrors Go's `VerifyLeaf`. Re-serializes the same CBOR struct and checks the CID matches.
     public func verifyLeaf() throws {
         if let content, let contentHash, !contentHash.isEmpty {
-            let computedHash = Data(SHA256.hash(data: content))
+            let computedHash = sha256Digest(content)
             guard computedHash == contentHash else {
                 throw DagError.brokenDag("content hash mismatch")
             }
@@ -276,7 +273,7 @@ extension DagLeaf {
     /// Also validates ContentSize and DagSize by recalculating from children when a full DAG is provided.
     public func verifyRootLeaf(dag: Dag? = nil) throws {
         if let content, let contentHash, !contentHash.isEmpty {
-            let computedHash = Data(SHA256.hash(data: content))
+            let computedHash = sha256Digest(content)
             guard computedHash == contentHash else {
                 throw DagError.brokenDag("content hash mismatch")
             }

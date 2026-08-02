@@ -35,22 +35,40 @@ extension Dag {
 
             let sortedLinks = currentLeaf.links.sorted()
 
+            // Build the parent's Merkle tree at most ONCE and derive every
+            // child's proof from it, instead of rebuilding the identical tree
+            // for each child the way proofForChild does. Semantics match
+            // proofForChild exactly: no tree — and thus no proof — when the
+            // parent has at most one link, and a failed build means the
+            // packet carries no proof, just as `try?` does there.
+            var parentTree: MerkleTree? = nil
+            var builtParentTree = false
+
             for childHash in sortedLinks {
                 if !visited.contains(childHash) {
                     guard let childLeaf = leafs[childHash] else { continue }
 
-                    // Build the proof against the parent this packet declares.
-                    // buildVerificationBranch resolves a parent by scanning the
-                    // leafs dictionary, whose order is unspecified, so a chunk
-                    // linked by several parents could be given a proof belonging
-                    // to a different parent than parentHash and fail to verify.
-                    let proof = proofForChild(parent: currentLeaf, childHash: childHash)
+                    if currentLeaf.links.count > 1 && !builtParentTree {
+                        builtParentTree = true
+                        let builder = TreeContent()
+                        for linkHash in currentLeaf.links {
+                            builder.addLeaf(key: linkHash, data: linkHash)
+                        }
+                        parentTree = (try? builder.build())?.0
+                    }
 
                     let leafClone = childLeaf.clone()
                     var packet = TransmissionPacket(leaf: leafClone, parentHash: current)
 
-                    if let proof = proof {
-                        packet.proofs[childHash] = proof
+                    // The proof is built against the parent this packet
+                    // declares (see proofForChild): a chunk linked by several
+                    // parents must not be handed a proof belonging to a
+                    // different parent than parentHash.
+                    if let tree = parentTree {
+                        let (index, exists) = tree.getIndexForKey(childHash)
+                        if exists {
+                            packet.proofs[childHash] = ClassicTreeBranch(leaf: childHash, proof: tree.proofs[index])
+                        }
                     }
 
                     sequence.append(packet)

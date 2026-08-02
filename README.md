@@ -6,7 +6,7 @@ A comprehensive Swift port of [Scionic-Merkle-Tree](https://github.com/HORNET-St
 
 ## What’s Ported
 
-This is a near-complete port of the Go library. **23 source files, 280 tests.** (`swift test` on Windows/Swift 6.3.1: 280 executed, **0 skipped**, 0 failures.)
+This is a near-complete port of the Go library. **24 source files, 280 tests.** (`swift test` with Swift 6.3.1: 280 executed, **0 skipped**, 0 failures — on both Windows and Linux/Ubuntu 24.04, exercising the CNG/BCrypt and swift-crypto hash backends respectively.)
 
 > Seven of those tests used to skip rather than run. They read a `spec/vectors`
 > corpus resolved from a sibling Go checkout, which was present on no machine, so
@@ -44,6 +44,7 @@ This is a near-complete port of the Go library. **23 source files, 280 tests.** 
 | Component | Swift File | What it replaces |
 |-----------|-----------|------------------|
 | CBOR Encoder/Decoder | `src/internal/CBOR.swift` | `fxamacker/cbor/v2` — deterministic encoding matching Go’s defaults |
+| SHA-256 backend | `src/internal/SHA256Backend.swift` | swift-crypto's portable-C fallback on Windows — the default hash path is CNG/`BCryptHashData` there (9.4× raw throughput); Apple and Linux delegate to swift-crypto unchanged |
 | Wire JSON writer | `src/internal/WireJSON.swift` | `encoding/json` (`MarshalIndent`) — Go’s exact indentation, escaping and separators, written from the same wire tree the CBOR encoder reads |
 | Wire JSON parser | `src/internal/WireJSONParser.swift` + `WireJSONSchema.swift` | `encoding/json` (`Unmarshal`) — order-preserving parse plus a schema-directed walk back into that wire tree |
 | CID Generation | `src/internal/CID.swift` | `go-cid` + `go-multihash` + `go-multicodec` — CIDv1 with CBOR codec (0x51) + SHA2-256 |
@@ -114,7 +115,61 @@ vector in the corpus that can fail for that reason.
 Replacing `JSONDecoder` along the way made `Dag.fromJSON` about **12.8× faster**
 (775 ms → 60 ms on an 18.25 MiB corpus), at a cost of roughly 15% on `toJSON`.
 Correctness was the point; the decode win was a side effect of not routing wire
-bytes through Foundation.
+bytes through Foundation. A later optimization pass recovered part of that
+`toJSON` cost and moved every other hot path — see
+[Performance](#performance).
+
+## Performance
+
+Measured on Windows (Swift 6.3.1, 24 CPUs) against the Go reference and the
+Rust port: same 18.25 MiB corpus, 256 KiB chunks, min of 15 samples, all three
+harnesses back to back in one session. Every harness prints its DAG root and
+encoded sizes first, and all three match at every chunk size, so the timings
+compare equal work. Lower is better:
+
+| Workload | Swift | Go | Rust |
+|---|---:|---:|---:|
+| `create_sequential` | 53.48 ms | 15.80 ms | 18.66 ms |
+| `create_parallel` | 9.66 ms | 4.80 ms | 3.46 ms |
+| `verify` | 17.44 ms | 10.93 ms | 5.02 ms |
+| `to_cbor` | 9.95 ms | 3.57 ms | 4.71 ms |
+| `from_cbor` | **3.02 ms** | 3.16 ms | 3.09 ms |
+| `to_json` | 81.38 ms | 79.75 ms | 67.09 ms |
+| `from_json` | 61.43 ms | 70.78 ms | 48.29 ms |
+| `leaf_sequence` | **0.32 ms** | 2.79 ms | 2.63 ms |
+| `batched_sequence` | 0.291 ms | 0.089 ms | 0.102 ms |
+
+`from_cbor` and `leaf_sequence` lead all three ports, and `from_json` is ahead
+of Go. These numbers follow an optimization pass that changed **no output
+byte** — same roots, same encoded bytes, same 226-file spec-vector digest,
+280/280 tests:
+
+- **SHA-256 on Windows goes through CNG/BCrypt**
+  (`src/internal/SHA256Backend.swift`). swift-crypto's vendored BoringSSL ships
+  only `__ELF__`/`__APPLE__` assembly, so on Windows every `.S` file compiles
+  empty and SHA-256 ran as portable C: 449 MB/s against 4,199 MB/s through
+  `BCryptHashData` on the same machine — 9.4× one-shot, and BCrypt is faster at
+  every input size down to 64 B (287 ns vs 515 ns per hash). Apple and Linux
+  builds are untouched: the seam delegates to swift-crypto there, which on
+  Apple platforms re-exports CryptoKit and is already hardware-accelerated.
+- **The CBOR encoder writes into one exactly pre-sized `[UInt8]` buffer**
+  (`CBOREncoder.encodedSize` mirrors the encoder case for case), replacing
+  incremental `Data` growth.
+- **Default Merkle pair hashing streams both siblings into one hasher**
+  instead of concatenating them into a fresh buffer per pair.
+- **`getLeafSequence` builds each parent's proof tree once per parent** rather
+  than once per child, which is why it now leads both other ports.
+
+Two honest caveats. The Windows Swift 6.3.1 toolchain ships a standard library
+built `+assertions` — a cost the Go and Rust toolchains do not carry, and
+`-c release` cannot remove from the stdlib — so some share of the remaining
+create/verify gap is toolchain rather than port. And Windows is a declared
+proxy for the production target: the encoder/allocation gains are relative and
+expected to transfer to iOS, the BCrypt backend does not reach iOS at all
+(Apple builds hash through CryptoKit), and absolute iOS numbers remain
+unmeasured until the suite runs on a Mac. The non-Windows code path itself is
+more than inspected, though: the same suite passes 280/280 on Linux with the
+same toolchain version, hashing through swift-crypto's BoringSSL.
 
 ## Features
 
@@ -235,7 +290,7 @@ let dag = try createDagWithConfig(path: "/large/directory", config: config)
 src/
 ├── dag/                  — Scionic DAG types, leaves, creation, verification, serialization, transmission, store
 ├── diff/                 — DAG diffing and patching
-├── internal/             — CBOR, CID, Base encodings, Varint
+├── internal/             — CBOR, CID, SHA-256 backend, Base encodings, Varint
 ├── classic-merkle-tree/  — Classic Merkle Tree proof generation/verification
 ├── classic-tree-wrapper/ — Key/value wrapper around Classic Merkle Trees
 ├── testutil/             — Fixture builders used by parity tests
@@ -259,7 +314,7 @@ tests/
 
 | Package | Purpose |
 |---------|---------|
-| [swift-crypto](https://github.com/apple/swift-crypto) | SHA-256 hashing (Apple official, cross-platform) |
+| [swift-crypto](https://github.com/apple/swift-crypto) | SHA-256 hashing on Apple platforms (a CryptoKit re-export there) and Linux; Windows builds hash through the OS's CNG/BCrypt via `src/internal/SHA256Backend.swift` instead |
 
 **That’s it.** CBOR, CID, multihash, multibase, base58, base32, Merkle trees — all implemented directly in Swift.
 
