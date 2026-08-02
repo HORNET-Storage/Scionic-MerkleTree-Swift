@@ -20,7 +20,7 @@ Each layer builds on the previous. Start from Layer 1 and work up. A port that p
 - **Layer 4** — Verify your DAG creation from a filesystem produces the identical root hash
 - **Layer 5** — Verify your DAG operations (verify, serialize, transmit, diff, store, partial DAGs) work correctly
 
-The Swift port currently verifies this contract with **269 XCTest tests**, none of which skip — the `spec/vectors` corpus is committed to this repository, and its absence now fails rather than skipping. That total includes the 18 direct cross-compatibility vector tests plus fixture root, true file streaming, store index/cache/update APIs, store ownership, store streaming, chunk-reassembly ordering, serialization, partial-DAG, batched-transmission, DAG parallel multi-chunk-file, classic-tree parallel proof-update, wire-map ordering, wire shape, and clone-independence parity regressions.
+The Swift port currently verifies this contract with **280 XCTest tests**, none of which skip — the `spec/vectors` corpus is committed to this repository, and its absence now fails rather than skipping. That total includes the 18 direct cross-compatibility vector tests plus fixture root, true file streaming, store index/cache/update APIs, store ownership, store streaming, chunk-reassembly ordering, serialization, partial-DAG, batched-transmission, DAG parallel multi-chunk-file, classic-tree parallel proof-update, wire-map ordering, wire shape, wire-JSON byte parity, and clone-independence parity regressions.
 
 > The cross-compat figure disagreed with itself — 12 here, 18 in the Language Ports table at the end. 18 is the measured value (`swift test --filter CrossCompat`), and both places now say so. Counts in prose drift; where one appears twice, it will eventually be wrong once.
 
@@ -88,10 +88,30 @@ Verify these CBOR encodings:
 > | `proofs` | `SerializableTransmissionPacket` |
 > | `Relationships` | `SerializableBatchedTransmissionPacket` |
 >
-> Ordering there is **length-first, then bytewise** on the UTF-8 key — RFC 8949's
-> rule for text keys. A port that sorts the struct fields too will fail
-> `WireShapeTests` and `CrossCompatWireTests`; a port that sorts nothing will fail
-> the spec-vector byte comparison.
+> **The comparator depends on the output format, and the two do not agree.** CBOR
+> sorts **length-first, then bytewise** on the UTF-8 key — RFC 8949's rule for text
+> keys. JSON sorts **plain bytewise, with no length term**, because Go reaches JSON
+> through `encoding/json`, which sorts map keys with a straight string compare. Go
+> is the reference, so a port must implement both rules, each in its own format:
+>
+> ```text
+> keys: m (1), zz-probe (8), aaa-probe (9)
+> CBOR: m, zz-probe, aaa-probe
+> JSON: aaa-probe, m, zz-probe
+> ```
+>
+> The two agree on every pair of equal-length keys and disagree otherwise. Four of
+> the five maps above are keyed by CIDs, and a CID is always exactly 59 characters,
+> so `AdditionalData` is the only one that can ever expose the difference — which
+> is why the Rust port shipped CBOR's comparator inside its JSON writer for four
+> releases with every test green. **Building one ordered tree and handing it to
+> both writers is safe only if the comparator is a parameter of the build.**
+>
+> A port that sorts the struct fields too will fail `WireShapeTests` and
+> `CrossCompatWireTests`; a port that sorts nothing will fail the spec-vector byte
+> comparison; a port that uses a single comparator for both formats will fail the
+> `json_metadata_probe` spec vector — and nothing else, which is the whole reason
+> that vector exists.
 >
 > `stored_proofs` and `proofs` are omitted entirely when empty, and that omission
 > has its own guard (`WireShapeTests.testOmitEmptyStillDropsEmptyProofMaps`, and
@@ -429,6 +449,21 @@ Once your port creates DAGs with matching root hashes, verify these operations:
 - `dag.ToCBOR()` → `Dag.FromCBOR(data)` → `restored.Verify()` passes
 - Root hash is preserved through serialization
 - Partial DAG JSON round-trips preserve stored proof keys, proof leaf values, siblings, and path bits
+- **Both encodings are byte-identical to Go, not merely round-trippable.** The shared `spec/vectors` corpus commits a `.json` sibling for every `.cbor` artifact, and a port must reproduce both byte for byte
+- **A value decoded from JSON must re-encode to the committed CBOR bytes**, and the reverse. Round-tripping each format into itself only shows a port is self-consistent; crossing the formats is what shows the two decoders agree
+- JSON output matches Go's `json.MarshalIndent(v, "", "  ")` exactly: two-space indent, `": "` after each key, `[]` and `{}` for empty collections, and `null` for absent optionals
+- Escaping matches Go's `SetEscapeHTML(true)` default, spelled out in full because this is the part ports get wrong:
+
+| Character | Written as |
+|---|---|
+| `<` `>` `&` | escaped to the `\u00xx` form — hex `3c`, `3e`, `26` |
+| U+2028, U+2029 | escaped to the `\uxxxx` form — hex `2028`, `2029` |
+| any other below U+0020 | `\u00xx`, **lowercase** hex |
+| `"` `\` backspace formfeed newline CR tab | `\"` `\\` `\b` `\f` `\n` `\r` `\t` |
+| solidus `/` | `/` — **not** escaped |
+
+  Swift's `Codable` escapes the solidus and Go does not, which alone is enough to break every document: base64 content is full of them.
+- Do not reach for a language's idiomatic reflection-based JSON encoder here. Swift's `Codable` produced camelCase keys, alphabetical order, `"k" : v` spacing, expanded empty containers, omitted nil keys and an escaped solidus — six independent divergences at once, none of which a round-trip test can see
 
 ### 5.4 Transmission
 - `dag.GetLeafSequence()` produces packets in BFS order (root first)
@@ -553,8 +588,8 @@ These test files are in `tests/crosscompat_*.go`.
 | Language | Status | Repository |
 |----------|--------|-----------|
 | **Go** | ✅ Reference implementation | [HORNET-Storage/Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) |
-| **Swift** | ✅ Complete (269 tests, 0 skipped; 18 direct cross-compat plus fixture/store/index/streaming/transmission/parallel/ownership/wire-ordering/wire-shape parity) | This repository |
-| **Rust** | ✅ Complete (114 tests: layers 1–5 including parallel creation and the store-backed half, pinned against Go-generated wire vectors) | `Scionic-MerkleTree-Rust` (local, not yet published) |
+| **Swift** | ✅ Complete (280 tests, 0 skipped; 18 direct cross-compat plus fixture/store/index/streaming/transmission/parallel/ownership/wire-ordering/wire-shape/wire-JSON parity) | This repository |
+| **Rust** | ✅ Complete (119 tests: layers 1–5 including parallel creation and the store-backed half, pinned against Go-generated wire vectors in both CBOR and JSON) | `Scionic-MerkleTree-Rust` (local, not yet published) |
 | TypeScript | — | — |
 | Python | — | — |
 | Kotlin | — | — |

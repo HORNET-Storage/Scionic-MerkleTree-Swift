@@ -1,18 +1,30 @@
 // Serialization.swift — JSON and CBOR serialization/deserialization
 //
 // Ported from dag/serialize.go.
-// Uses Swift Codable for JSON, CBOREncoder/CBORDecoder for CBOR.
-// FromSerializable rebuilds Classic Merkle Trees from links and reconstructs parent hashes.
 //
-// CBOR field names match Go's fxamacker/cbor defaults:
+// Both wire formats are written from ONE shared tree: `wireValue(order:)` builds a
+// `CBORValue`, and either `CBOREncoder` or `encodeWireJSON` writes it out. That is
+// what makes key names and struct field order structurally unable to drift between
+// CBOR and JSON -- the two writers are reading the same tree, not two parallel
+// descriptions of it. Decoding mirrors that: JSON is parsed, walked into the same
+// `CBORValue` shape, and handed to the one set of `cborToSerializable*` decoders.
+//
+// The serializable types are deliberately NOT Codable. Foundation's JSONEncoder
+// cannot reproduce Go's output -- it has no declaration-order mode, writes
+// `"k" : v`, expands empty containers across three lines, omits nil keys where Go
+// writes `null`, and escapes the solidus. A Codable conformance here would be a
+// loaded gun: any consumer calling JSONEncoder on these types would silently emit
+// JSON that no other port can read. Wire JSON goes through toJSON()/fromJSON().
+//
+// Field names match Go's fxamacker/cbor and encoding/json defaults:
 //   - PascalCase for all fields (Hash, ItemName, Type, etc.)
-//   - Except StoredProofs which has cbor:"stored_proofs" tag
+//   - Except stored_proofs, which Go tags `stored_proofs,omitempty` in both formats
 
 import Foundation
 
-// MARK: - Serializable Types (Codable)
+// MARK: - Serializable Types
 
-public struct SerializableDagLeaf: Codable {
+public struct SerializableDagLeaf {
     public var hash: String = ""
     public var itemName: String = ""
     public var type: String = ""
@@ -26,22 +38,15 @@ public struct SerializableDagLeaf: Codable {
     public var links: [String] = []
     public var additionalData: [String: String] = [:]
     public var storedProofs: [String: SerializableProof]? = nil
-
-    enum CodingKeys: String, CodingKey {
-        case hash, itemName, type, contentHash, content, classicMerkleRoot
-        case currentLinkCount, leafCount, contentSize, dagSize
-        case links, additionalData
-        case storedProofs = "stored_proofs"
-    }
 }
 
-public struct SerializableProof: Codable {
+public struct SerializableProof {
     public var leaf: String = ""
     public var siblings: [Data] = []
     public var path: UInt32 = 0
 }
 
-public struct SerializableDag: Codable {
+public struct SerializableDag {
     public var root: String = ""
     public var leafs: [String: SerializableDagLeaf] = [:]
 }
@@ -84,19 +89,19 @@ extension Dag {
         return serializable
     }
 
-    /// Serializes the DAG to JSON.
+    /// Serializes the DAG to JSON, byte-identical to Go's `ToJSON()`.
+    ///
+    /// The `.json` key order is not cosmetic. Go reaches JSON through
+    /// `encoding/json`, which sorts map keys bytewise with no length term, while
+    /// CBOR sorts length-first. The two disagree whenever a dynamic map holds keys
+    /// of differing length -- in practice, AdditionalData.
     public func toJSON() throws -> Data {
-        let serializable = toSerializable()
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return try encoder.encode(serializable)
+        return try encodeWireJSON(wireValue(order: .json))
     }
 
     /// Deserializes a DAG from JSON.
     public static func fromJSON(_ data: Data) throws -> Dag {
-        let decoder = JSONDecoder()
-        let serializable = try decoder.decode(SerializableDag.self, from: data)
-        return fromSerializable(serializable)
+        return try fromWireValue(jsonDagToCBOR(parseWireJSON(data)))
     }
 
     /// Reconstructs a Dag from its serializable form.
@@ -185,35 +190,43 @@ extension Dag {
 
 extension Dag {
 
+    /// Builds the wire tree that BOTH output formats are written from.
+    ///
+    /// Leafs is a genuine dynamic map (Go: SerializableDag.Leafs), so it sorts. The
+    /// two pairs around it are struct fields and must stay in declaration order.
+    func wireValue(order: WireKeyOrder) -> CBORValue {
+        let serializable = toSerializable()
+
+        var leafPairs: [(String, CBORValue)] = []
+        leafPairs.reserveCapacity(serializable.leafs.count)
+        for (hash, sLeaf) in serializable.leafs {
+            leafPairs.append((hash, serializableDagLeafToCBOR(sLeaf, order: order)))
+        }
+
+        return .map(CBOROrderedMap([
+            ("Root", .textString(serializable.root)),
+            ("Leafs", CBOREncoder.sortedWireMap(leafPairs, order: order)),
+        ]))
+    }
+
     /// Serializes the DAG to CBOR format.
     ///
     /// Mirrors Go's `ToCBOR()`. Uses PascalCase field names matching fxamacker/cbor defaults.
     public func toCBOR() -> Data {
-        let cborEncoder = CBOREncoder()
-        let serializable = toSerializable()
-
-        // Leafs is a genuine dynamic map, so it sorts. The two pairs around it are
-        // struct fields (Go: SerializableDag) and must stay in declaration order.
-        var leafPairs: [(String, CBORValue)] = []
-        for (hash, sLeaf) in serializable.leafs {
-            leafPairs.append((hash, serializableDagLeafToCBOR(sLeaf)))
-        }
-
-        return cborEncoder.encodeMap([
-            ("Root", .textString(serializable.root)),
-            ("Leafs", CBOREncoder.sortedCBORMap(leafPairs)),
-        ])
+        return CBOREncoder().encode(wireValue(order: .cbor))
     }
 
     /// Deserializes a DAG from CBOR format.
     ///
     /// Mirrors Go's `FromCBOR(data)`.
     public static func fromCBOR(_ data: Data) throws -> Dag {
-        let decoder = CBORDecoder()
-        let value = try decoder.decode(data)
+        return try fromWireValue(CBORDecoder().decode(data))
+    }
 
+    /// Decodes the shared wire shape, whichever format it arrived in.
+    static func fromWireValue(_ value: CBORValue) throws -> Dag {
         guard let map = value.mapValue else {
-            throw DagError.brokenDag("CBOR root is not a map")
+            throw DagError.brokenDag("wire root is not a map")
         }
 
         let root = map["Root"]?.stringValue ?? ""
@@ -239,7 +252,7 @@ extension Dag {
 
 // MARK: - CBOR Encoding Helpers
 
-func serializableDagLeafToCBOR(_ sLeaf: SerializableDagLeaf) -> CBORValue {
+func serializableDagLeafToCBOR(_ sLeaf: SerializableDagLeaf, order: WireKeyOrder) -> CBORValue {
     var pairs: [(String, CBORValue)] = [
         ("Hash", .textString(sLeaf.hash)),
         ("ItemName", .textString(sLeaf.itemName)),
@@ -252,7 +265,7 @@ func serializableDagLeafToCBOR(_ sLeaf: SerializableDagLeaf) -> CBORValue {
         ("ContentSize", .int64(sLeaf.contentSize)),
         ("DagSize", .int64(sLeaf.dagSize)),
         ("Links", .array(sLeaf.links.map { .textString($0) })),
-        ("AdditionalData", encodeSortedMapToCBOR(sLeaf.additionalData)),
+        ("AdditionalData", encodeSortedMapToCBOR(sLeaf.additionalData, order: order)),
     ]
 
     // stored_proofs is omitted entirely when empty -- Go tags it `omitempty`, and
@@ -260,12 +273,14 @@ func serializableDagLeafToCBOR(_ sLeaf: SerializableDagLeaf) -> CBORValue {
     // every leaf in every full DAG.
     if let sp = sLeaf.storedProofs, !sp.isEmpty {
         let proofPairs = sp.map { ($0.key, serializableProofToCBOR($0.value)) }
-        pairs.append(("stored_proofs", CBOREncoder.sortedCBORMap(proofPairs)))
+        pairs.append(("stored_proofs", CBOREncoder.sortedWireMap(proofPairs, order: order)))
     }
 
     return .map(CBOROrderedMap(pairs))
 }
 
+/// Struct-shaped throughout: Leaf, Proof, Siblings and Path are all declared fields
+/// rather than dynamic maps, so nothing here sorts and no key order is needed.
 func serializableProofToCBOR(_ sp: SerializableProof) -> CBORValue {
     return .map(CBOROrderedMap([
         ("Leaf", .textString(sp.leaf)),
@@ -276,10 +291,13 @@ func serializableProofToCBOR(_ sp: SerializableProof) -> CBORValue {
     ]))
 }
 
-func encodeSortedMapToCBOR(_ m: [String: String]) -> CBORValue {
-    // AdditionalData is the one wire map with arbitrary, mixed-length keys, so it
-    // is the only place the length-first rule is observable at all.
-    return CBOREncoder.sortedCBORMap(m.map { ($0.key, CBORValue.textString($0.value)) })
+func encodeSortedMapToCBOR(_ m: [String: String], order: WireKeyOrder) -> CBORValue {
+    // AdditionalData is the one wire map with arbitrary, mixed-length keys, so it is
+    // the only place the CBOR and JSON comparators can actually disagree.
+    return CBOREncoder.sortedWireMap(
+        m.map { ($0.key, CBORValue.textString($0.value)) },
+        order: order
+    )
 }
 
 // MARK: - CBOR Decoding Helpers
@@ -338,32 +356,19 @@ func cborToSerializableProof(_ value: CBORValue) -> SerializableProof {
     return sp
 }
 
-// MARK: - Serializable Packet Types (Codable)
+// MARK: - Serializable Packet Types
 
-public struct SerializableTransmissionPacket: Codable {
+public struct SerializableTransmissionPacket {
     public var leaf: SerializableDagLeaf = SerializableDagLeaf()
     public var parentHash: String = ""
     public var proofs: [String: SerializableProof]? = nil
-
-    enum CodingKeys: String, CodingKey {
-        case leaf = "Leaf"
-        case parentHash = "ParentHash"
-        case proofs
-    }
 }
 
-public struct SerializableBatchedTransmissionPacket: Codable {
+public struct SerializableBatchedTransmissionPacket {
     public var leaves: [SerializableDagLeaf] = []
     public var relationships: [String: String] = [:]
     public var packetIndex: Int = 0
     public var totalPackets: Int = 0
-
-    enum CodingKeys: String, CodingKey {
-        case leaves = "Leaves"
-        case relationships = "Relationships"
-        case packetIndex = "PacketIndex"
-        case totalPackets = "TotalPackets"
-    }
 }
 
 // MARK: - TransmissionPacket Serialization
@@ -384,37 +389,40 @@ extension TransmissionPacket {
         return s
     }
 
-    public func toJSON() throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return try encoder.encode(toSerializable())
-    }
-
-    public func toCBOR() -> Data {
+    /// Builds the wire tree that BOTH output formats are written from.
+    func wireValue(order: WireKeyOrder) -> CBORValue {
         let s = toSerializable()
-        let cborEncoder = CBOREncoder()
         var pairs: [(String, CBORValue)] = [
-            ("Leaf", serializableDagLeafToCBOR(s.leaf)),
+            ("Leaf", serializableDagLeafToCBOR(s.leaf, order: order)),
             ("ParentHash", .textString(s.parentHash)),
         ]
         if let sp = s.proofs, !sp.isEmpty {
             let proofPairs = sp.map { ($0.key, serializableProofToCBOR($0.value)) }
-            pairs.append(("proofs", CBOREncoder.sortedCBORMap(proofPairs)))
+            pairs.append(("proofs", CBOREncoder.sortedWireMap(proofPairs, order: order)))
         }
-        return cborEncoder.encodeMap(pairs)
+        return .map(CBOROrderedMap(pairs))
+    }
+
+    public func toJSON() throws -> Data {
+        return try encodeWireJSON(wireValue(order: .json))
+    }
+
+    public func toCBOR() -> Data {
+        return CBOREncoder().encode(wireValue(order: .cbor))
     }
 
     public static func fromJSON(_ data: Data) throws -> TransmissionPacket {
-        let decoder = JSONDecoder()
-        let s = try decoder.decode(SerializableTransmissionPacket.self, from: data)
-        return transmissionPacketFromSerializable(s)
+        return try fromWireValue(jsonTransmissionPacketToCBOR(parseWireJSON(data)))
     }
 
     public static func fromCBOR(_ data: Data) throws -> TransmissionPacket {
-        let decoder = CBORDecoder()
-        let value = try decoder.decode(data)
+        return try fromWireValue(CBORDecoder().decode(data))
+    }
+
+    /// Decodes the shared wire shape, whichever format it arrived in.
+    static func fromWireValue(_ value: CBORValue) throws -> TransmissionPacket {
         guard let map = value.mapValue else {
-            throw DagError.brokenDag("CBOR packet is not a map")
+            throw DagError.brokenDag("wire packet is not a map")
         }
         var s = SerializableTransmissionPacket()
         if let leafVal = map["Leaf"] { s.leaf = cborToSerializableDagLeaf(leafVal) }
@@ -443,31 +451,42 @@ extension BatchedTransmissionPacket {
         return s
     }
 
+    /// Builds the wire tree that BOTH output formats are written from.
+    func wireValue(order: WireKeyOrder) -> CBORValue {
+        let s = toSerializable()
+        let leavesValue = CBORValue.array(
+            s.leaves.map { serializableDagLeafToCBOR($0, order: order) }
+        )
+        let relationshipPairs = s.relationships.map { ($0.key, CBORValue.textString($0.value)) }
+
+        return .map(CBOROrderedMap([
+            ("Leaves", leavesValue),
+            ("Relationships", CBOREncoder.sortedWireMap(relationshipPairs, order: order)),
+            ("PacketIndex", s.packetIndex >= 0 ? .unsignedInt(UInt64(s.packetIndex)) : .negativeInt(Int64(s.packetIndex))),
+            ("TotalPackets", s.totalPackets >= 0 ? .unsignedInt(UInt64(s.totalPackets)) : .negativeInt(Int64(s.totalPackets))),
+        ]))
+    }
+
     public func toJSON() throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return try encoder.encode(toSerializable())
+        return try encodeWireJSON(wireValue(order: .json))
     }
 
     public func toCBOR() -> Data {
-        let s = toSerializable()
-        let encoder = CBOREncoder()
-        let leavesValue = CBORValue.array(s.leaves.map { serializableDagLeafToCBOR($0) })
-        let relationshipPairs = s.relationships.map { ($0.key, CBORValue.textString($0.value)) }
-
-        return encoder.encodeMap([
-            ("Leaves", leavesValue),
-            ("Relationships", CBOREncoder.sortedCBORMap(relationshipPairs)),
-            ("PacketIndex", s.packetIndex >= 0 ? .unsignedInt(UInt64(s.packetIndex)) : .negativeInt(Int64(s.packetIndex))),
-            ("TotalPackets", s.totalPackets >= 0 ? .unsignedInt(UInt64(s.totalPackets)) : .negativeInt(Int64(s.totalPackets))),
-        ])
+        return CBOREncoder().encode(wireValue(order: .cbor))
     }
 
     public static func fromCBOR(_ data: Data) throws -> BatchedTransmissionPacket {
-        let decoder = CBORDecoder()
-        let value = try decoder.decode(data)
+        return try fromWireValue(CBORDecoder().decode(data))
+    }
+
+    public static func fromJSON(_ data: Data) throws -> BatchedTransmissionPacket {
+        return try fromWireValue(jsonBatchedPacketToCBOR(parseWireJSON(data)))
+    }
+
+    /// Decodes the shared wire shape, whichever format it arrived in.
+    static func fromWireValue(_ value: CBORValue) throws -> BatchedTransmissionPacket {
         guard let map = value.mapValue else {
-            throw DagError.brokenDag("CBOR batched packet is not a map")
+            throw DagError.brokenDag("wire batched packet is not a map")
         }
 
         var s = SerializableBatchedTransmissionPacket()
@@ -476,19 +495,13 @@ extension BatchedTransmissionPacket {
         }
         if let relationshipMap = map["Relationships"]?.mapValue {
             for pair in relationshipMap.pairs {
-                if let value = pair.value.stringValue {
-                    s.relationships[pair.key] = value
+                if let parent = pair.value.stringValue {
+                    s.relationships[pair.key] = parent
                 }
             }
         }
         s.packetIndex = map["PacketIndex"]?.intValue ?? 0
         s.totalPackets = map["TotalPackets"]?.intValue ?? 0
-        return batchedPacketFromSerializable(s)
-    }
-
-    public static func fromJSON(_ data: Data) throws -> BatchedTransmissionPacket {
-        let decoder = JSONDecoder()
-        let s = try decoder.decode(SerializableBatchedTransmissionPacket.self, from: data)
         return batchedPacketFromSerializable(s)
     }
 }

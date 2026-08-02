@@ -77,6 +77,34 @@ public enum CBORValue: Equatable {
     case undefined
 }
 
+// MARK: - Wire Key Order
+
+/// Which comparator a dynamic wire map's keys sort by.
+///
+/// CBOR and JSON do not agree on map key order, and never did. Both rules are
+/// deterministic; they are simply different rules, so the choice belongs to the
+/// output format rather than to the wire tree the two formats share:
+///
+///   - `.cbor` is RFC 8949 core-deterministic ordering -- keys sort by their
+///     ENCODED bytes, which for text keys reduces exactly to length-first, then
+///     bytewise. See `CBOREncoder.sortedWireMap` for why that reduction is exact.
+///   - `.json` is what Go's `encoding/json` does to a map: a plain bytewise
+///     compare over the key string, with no length term at all.
+///
+/// The two agree on every pair of equal-length keys, which is precisely why this
+/// divergence went unnoticed for so long. Four of the five dynamic wire maps are
+/// keyed by CIDs, which are always exactly 59 characters. `AdditionalData` is the
+/// one keyed by arbitrary caller-chosen strings, and it is empty in every spec
+/// vector and every benchmark-corpus leaf -- so no map any cross-port check has
+/// ever compared held two keys of different lengths.
+///
+/// The Rust port emitted the CBOR comparator into JSON until this was caught by
+/// diffing its bytes against Go. All three ports now carry the distinction.
+public enum WireKeyOrder {
+    case cbor
+    case json
+}
+
 // MARK: - Convenience Constructors
 
 extension CBORValue {
@@ -160,7 +188,7 @@ public struct CBOREncoder {
         return encode(.map(CBOROrderedMap(pairs)))
     }
 
-    /// Builds a CBOR map whose keys are in RFC 8949 core-deterministic order.
+    /// Builds a wire map whose keys are ordered by `order`.
     ///
     /// Applied PER MAP, at the few sites that build a genuinely dynamic map --
     /// `Leafs`, `AdditionalData`, `stored_proofs`, `proofs`, `Relationships` --
@@ -177,24 +205,36 @@ public struct CBOREncoder {
     ///     expected [Leaves, Relationships, PacketIndex, TotalPackets]  (declaration)
     ///     got      [Leaves, PacketIndex, TotalPackets, Relationships]  (sorted)
     ///
-    /// RFC 8949 orders map keys by their ENCODED bytes, bytewise. For text keys
-    /// that reduces to length-first, then bytewise on the UTF-8 -- and it reduces
-    /// exactly, at every boundary, because the encoded head grows monotonically
-    /// with length: a key shorter than 24 bytes starts with `0x60 + len` (at most
-    /// `0x77`), one of 24...255 bytes starts with `0x78`, one of 256...65535 with
-    /// `0x79`. A shorter key therefore always has a smaller leading byte, so
-    /// comparing `(count, bytes)` and comparing encoded forms never disagree.
+    /// That same five-way scoping is what makes `WireKeyOrder` safe to vary: only
+    /// these five maps ever see the JSON comparator, and the struct-shaped maps
+    /// around them stay in declaration order for BOTH output formats.
     ///
-    /// Note this is NOT the same comparator as `sortMapByKeys` /
+    /// For `.cbor`, RFC 8949 orders map keys by their ENCODED bytes, bytewise. For
+    /// text keys that reduces to length-first, then bytewise on the UTF-8 -- and it
+    /// reduces exactly, at every boundary, because the encoded head grows
+    /// monotonically with length: a key shorter than 24 bytes starts with
+    /// `0x60 + len` (at most `0x77`), one of 24...255 bytes starts with `0x78`, one
+    /// of 256...65535 with `0x79`. A shorter key therefore always has a smaller
+    /// leading byte, so comparing `(count, bytes)` and comparing encoded forms never
+    /// disagree.
+    ///
+    /// For `.json`, Go's `encoding/json` sorts map keys with a plain bytewise
+    /// compare and no length term, so the two orders differ whenever two keys in the
+    /// same map differ in length.
+    ///
+    /// Note neither is the same comparator as `sortMapByKeys` /
     /// `sortMapForVerification`, which order by the decoded string. Those feed the
     /// CID preimage, where AdditionalData is a CBOR *array* of key/value structs --
     /// map-key rules never apply to it, and its order is frozen into every CID ever
-    /// minted. Do not unify the two.
-    public static func sortedCBORMap(_ pairs: [(String, CBORValue)]) -> CBORValue {
+    /// minted. Do not unify the three.
+    public static func sortedWireMap(
+        _ pairs: [(String, CBORValue)],
+        order: WireKeyOrder
+    ) -> CBORValue {
         let sorted = pairs.sorted { left, right in
             let leftBytes = Array(left.0.utf8)
             let rightBytes = Array(right.0.utf8)
-            if leftBytes.count != rightBytes.count {
+            if order == .cbor && leftBytes.count != rightBytes.count {
                 return leftBytes.count < rightBytes.count
             }
             return leftBytes.lexicographicallyPrecedes(rightBytes)
