@@ -18,4 +18,4 @@
 /// This is a parity claim rather than an independent release history — see
 /// `PARITY_SPEC.md`. It had silently drifted to `2.0.0` while the package was
 /// tagged `v2.4.0`; keep it in step with the tag.
-public let version = "2.4.1"
+public let version = "2.4.2"
