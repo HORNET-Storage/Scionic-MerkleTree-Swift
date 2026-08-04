@@ -2,11 +2,13 @@
 
 A comprehensive Swift port of [Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) — a hybrid Merkle DAG / Merkle Tree data structure that combines the folder support of IPFS Merkle DAGs with the small branches of Classic Merkle Trees.
 
-**Proven byte-identical with the Go implementation** — 18 cross-compatibility tests verify that Swift produces the exact same CID hashes as Go for the same input, from individual leaves to full multi-level directory DAGs, backed by a further 21 Go-parity tests covering spec vectors, fixture roots and transmission packets.
+**Proven byte-identical with the Go implementation** — 18 cross-compatibility tests verify that Swift produces the exact same CID hashes as Go for the same input, from individual leaves to full multi-level directory DAGs, backed by a further 25 Go-parity tests covering spec vectors, fixture roots, transmission packets and fastcdc-v1 conformance.
+
+**Chunking**: new trees default to **fastcdc-v1 content-defined chunking** (min 512 KiB / target 2 MiB / max 8 MiB) — boundaries follow content, so an edit re-chunks only its neighborhood instead of shifting every fixed slice after it. Roots cut this way carry `"chunking": "fastcdc-v1"` in their additional data; the legacy fixed-size cutter stays available via `setChunkSize`, and verification never re-chunks, so both kinds of trees verify everywhere. The port was written for cross-implementation compatibility: Go, Rust and Swift cut bit-identical chunks for identical bytes on every platform — proven by the conformance manifest committed under `spec/fastcdc-vectors` — so content deduplicates no matter which implementation or OS produced it.
 
 ## What’s Ported
 
-This is a near-complete port of the Go library. **24 source files, 280 tests, 0 skipped.** CI runs the full suite on every push across Windows (CNG/BCrypt hashing), Linux (swift-crypto/BoringSSL), and macOS (CryptoKit).
+This is a near-complete port of the Go library. **25 source files, 294 tests, 0 skipped.** CI runs the full suite on every push across Windows (CNG/BCrypt hashing), Linux (swift-crypto/BoringSSL), and macOS (CryptoKit).
 
 ### Core (fully ported)
 
@@ -15,6 +17,7 @@ This is a near-complete port of the Go library. **24 source files, 280 tests, 0 
 | `dag/types.go` | `src/dag/Types.swift` | ✅ Complete | All types: Dag, DagLeaf, DagBuilder, DagLeafBuilder, ClassicTreeBranch, DagBranch, TransmissionPacket, BatchedTransmissionPacket, DagBuilderConfig, LeafType, LeafProcessor |
 | `dag/leaves.go` | `src/dag/Leaves.swift` | ✅ Complete | BuildLeaf, BuildRootLeaf, VerifyLeaf, VerifyRootLeaf (standalone root CID verification plus full-DAG ContentSize/DagSize validation), VerifyChildrenAgainstMerkleRoot, GetBranch, VerifyBranch, HasLink, AddLink, Clone, EstimateSize |
 | `dag/dag.go` | `src/dag/DagCreation.swift` + `src/dag/DagVerification.swift` + `src/dag/ChunkOrder.swift` + `src/dag/ParentIndex.swift` | ✅ Complete | CreateDag, CreateDagAdvanced, CreateDagCustom, CreateDagWithConfig, true chunked file reads, parallel creation (DispatchQueue worker pool), Verify (full + partial with Merkle proofs), IterateDag, CreateDirectory, GetContentFromLeaf, GetPartial, CalculateLabels, GetHashesByLabelRange, GetLabel, IsPartial, chunkIndexFromItemName / compareChunkItemNames, minimumParentIndex |
+| `dag/fastcdc.go` + `dag/fastcdc_gear.go` | `src/dag/FastCDC.swift` | ✅ Complete | fastcdc-v1 content-defined chunking (the default mode): frozen gear table + seed derivation, normative boundary loop, mode dispatch, streaming cutter with an 8 MiB window, public `cutChunks`, root chunking tag |
 | `dag/serialize.go` | `src/dag/Serialization.swift` | ✅ Complete | ToJSON, FromJSON, ToCBOR, FromCBOR, ReadDag, ToSerializable, FromSerializable (rebuilds Merkle trees + parent hashes). Both formats are written from one shared wire tree, so field names and order cannot drift between them |
 | `dag/transmission.go` | `src/dag/Transmission.swift` | ✅ Complete | GetLeafSequence (BFS with proofs), VerifyTransmissionPacket, ApplyTransmissionPacket, ApplyAndVerifyTransmissionPacket, RemoveAllContent, GetBatchedLeafSequence (size-limited batches), VerifyBatchedTransmissionPacket, ApplyBatchedTransmissionPacket, BatchedTransmissionPacket.GetRootLeaf |
 | `dag/store.go` | `src/dag/Store.swift` | ✅ Complete | LeafStore, ContentStore, batch/count/enumerator/cache protocols, DagStore verification/streaming verification without full DAG materialization, index build/cache/iterate/update-parent-hash APIs, MemoryLeafStore + MemoryContentStore |
@@ -51,7 +54,7 @@ This is a near-complete port of the Go library. **24 source files, 280 tests, 0 
 | **Deep directory** | **7 files, 4 subdirs, 3 levels deep** | **All 12 leaf hashes match, verify passes, all file contents recreated correctly** |
 | Wire format | Go skeleton and selected-leaf vectors, batched packet shape | Decodes and verifies against golden Go bytes; legacy counter-free packets stay decodable |
 
-A further **21 Go-parity tests** sit outside that directory: `SpecVectorParityTests` (9) walks the shared spec-vector corpus — committed under `spec/vectors` and byte-identical across the Go, Rust, and Swift repositories — `TransmissionParityTests` (9) covers packet flows, and `FixtureRootParityTests` (3) pins the standard fixture roots.
+A further **25 Go-parity tests** sit outside that directory: `SpecVectorParityTests` (9) walks the shared spec-vector corpus — committed under `spec/vectors` and byte-identical across the Go, Rust, and Swift repositories — `TransmissionParityTests` (9) covers packet flows, `FixtureRootParityTests` (3) pins the standard fixture roots, and `FastCDCVectorTests` (4) rebuilds the fastcdc-v1 conformance manifest committed under `spec/fastcdc-vectors`: chunk boundaries, chunk digests, edit-reuse partitions, DAG root CIDs and the root chunking tag, all against the values Go generated.
 
 The deep directory test creates this structure in both Go and Swift:
 ```
@@ -145,8 +148,9 @@ well, so both non-Windows hash backends are exercised on every push.
 
 - **Directory support** — entire directory trees become Scionic Merkle DAGs, like IPFS
 - **Small Merkle branches** — logarithmic proof sizes via Classic Merkle Trees inside parent leaves
+- **Content-defined chunking (fastcdc-v1)** — the default: boundaries follow content, so edits re-chunk only their neighborhood; byte-identical across Go, Rust and Swift, with the legacy fixed cutter still available via `setChunkSize`
 - **LeafSync** — numbered leaves with label-based range queries for synchronization
-- **Streaming I/O** — files are read with `FileHandle` chunks, one chunk in memory at a time
+- **Streaming I/O** — files are read with `FileHandle` chunks; fastcdc streams through one reusable 8 MiB window per file
 - **Storage-backed verification** — `DagStore.verifyStreaming()` verifies via metadata-first store access without calling `toDag()`
 - **Indexed storage traversal** — cache-backed `DagIndex` APIs support fast parent/child traversal and parent-hash updates
 - **Parallel creation** — `createDagWithConfig` with `enableParallel: true` uses DispatchQueue worker pools
@@ -188,6 +192,27 @@ import ScionicMerkleTree
 let dag = try createDag(path: "/path/to/directory", timestampRoot: false)
 try dag.verify()
 try dag.createDirectory(path: "/path/to/output")
+```
+
+### Chunking
+
+fastcdc-v1 content-defined chunking is the default: boundaries follow content
+(min 512 KiB / target 2 MiB / max 8 MiB), so inserting bytes into a large file
+re-chunks only the edited neighborhood instead of shifting every fixed slice
+after it. Roots cut this way carry `"chunking": "fastcdc-v1"` in their
+additional data; an absent tag means legacy fixed-size chunks. Verification
+never re-chunks, so trees cut by either mode verify everywhere.
+
+```swift
+// Default: fastcdc-v1 content-defined chunking
+let dag = try createDag(path: "/path/to/directory", timestampRoot: false)
+
+// Pin the legacy fixed-size cutter (what the spec-vector corpus pins)
+setChunkSize(defaultChunkSize)
+defer { setDefaultChunkSize() } // restore fastcdc-v1
+
+// Chunk in-memory content exactly the way the DAG builders do
+let chunks = cutChunks(data)
 ```
 
 ### Serialize / Deserialize
@@ -258,7 +283,7 @@ let dag = try createDagWithConfig(path: "/large/directory", config: config)
 
 ```
 src/
-├── dag/                  — Scionic DAG types, leaves, creation, verification, serialization, transmission, store
+├── dag/                  — Scionic DAG types, leaves, creation, fastcdc-v1 + legacy chunking, verification, serialization, transmission, store
 ├── diff/                 — DAG diffing and patching
 ├── internal/             — CBOR, CID, SHA-256 backend, Base encodings, Varint
 ├── classic-merkle-tree/  — Classic Merkle Tree proof generation/verification
@@ -269,7 +294,7 @@ src/
 tests/
 ├── diff/                 — DAG diff/apply tests
 ├── classic-tree-wrapper/ — Go tree wrapper parity tests
-├── tests/                — Go-style integration, DAG, partial, store, store-index, streaming, transmission, fixture, and cross-compat tests
+├── tests/                — Go-style integration, DAG, partial, store, store-index, streaming, transmission, fixture, cross-compat, and fastcdc unit + conformance tests
 ├── AuditTests.swift      — clone, serialization, store, transmission, diff, partial flows
 ├── AuditSecurityTests.swift — path-traversal rejection, streaming tamper detection, forged-child detection
 ├── FixtureTests.swift    — standard fixture coverage across DAG operations
@@ -278,6 +303,10 @@ tests/
 ├── CBORTests.swift       — CBOR encoding/decoding determinism
 ├── CIDTests.swift        — varint, base32, base58, CID generation
 └── ScionicMerkleTreeTests.swift — package smoke test
+
+spec/
+├── vectors/          — shared spec-vector corpus, byte-identical across the Go, Rust and Swift repos
+└── fastcdc-vectors/  — fastcdc-v1 conformance manifest (boundaries, chunk digests, reuse partitions, DAG roots)
 ```
 
 ## Dependencies

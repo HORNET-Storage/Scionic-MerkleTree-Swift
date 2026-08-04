@@ -159,6 +159,14 @@ final class CrossCompatWireTests: XCTestCase {
     }
 
     func testSwiftBuilder_ReproducesGoldenGoRoot() throws {
+        // The golden bytes were captured from deployed Go v2.2.6 — pre-fastcdc,
+        // so its root is an untagged fixed-2m cut. Pin the legacy mode this
+        // vector was built under: the fastcdc-v1 default stamps a root
+        // "chunking" tag, which changes the root CID by design (the fixture's
+        // 18-byte files chunk identically either way — only the tag differs).
+        setChunkSize(defaultChunkSize)
+        defer { setDefaultChunkSize() }
+
         let repoDir = try makeGoldenRepoDirectory()
         defer { try? FileManager.default.removeItem(atPath: repoDir.base) }
         let built = try ScionicMerkleTree.createDag(path: repoDir.repo, timestampRoot: false)

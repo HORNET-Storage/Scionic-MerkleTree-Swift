@@ -9,23 +9,33 @@ import Foundation
 /// Default chunk size for file processing (2MB).
 public let defaultChunkSize = 2048 * 1024
 
-/// Current chunk size. Files larger than this are split into chunks.
+/// Current fixed chunk size, used by the LEGACY fixed-size mode only (after
+/// `setChunkSize` / `disableChunking`). Under the default fastcdc-v1 mode
+/// boundaries are content-defined and this value is not consulted.
 /// Set to -1 to disable chunking (entire files become single chunks).
 public var chunkSize = defaultChunkSize
 
-/// Sets the chunk size for file processing.
+/// Sets the chunk size for file processing and switches the producer to the
+/// LEGACY fixed-size chunking mode. fastcdc-v1 stays off until
+/// `setDefaultChunkSize` restores it. (Mirrors Go's `SetChunkSize`.)
 public func setChunkSize(_ size: Int) {
+    chunkingFastCDC = false
     chunkSize = size
 }
 
-/// Disables chunking entirely (files processed as single chunks).
+/// Disables chunking entirely (files processed as single chunks) — a legacy
+/// fixed-mode variant, so fastcdc-v1 is switched off too.
 public func disableChunking() {
     setChunkSize(-1)
 }
 
-/// Resets to default chunk size (2MB).
+/// Restores the DEFAULT chunking behavior: fastcdc-v1 content-defined
+/// chunking, with `chunkSize` reset for any legacy reader of it.
+/// (Mirrors Go's `SetDefaultChunkSize`, which assigns both fields directly —
+/// routing through `setChunkSize` would clear the fastcdc flag again.)
 public func setDefaultChunkSize() {
-    setChunkSize(defaultChunkSize)
+    chunkingFastCDC = true
+    chunkSize = defaultChunkSize
 }
 
 // MARK: - Batch Size Configuration

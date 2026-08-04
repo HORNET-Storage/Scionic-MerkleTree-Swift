@@ -67,6 +67,11 @@ public func createDagWithConfig(path: String, config: DagBuilderConfig?) throws 
 // MARK: - Internal DAG Creation
 
 private func createDagInternal(path: String, additionalData: [String: String]?, processor: LeafProcessor?) throws -> Dag {
+    // Stamp the active chunking tag once, up front, exactly like Go's
+    // CreateDag: the stamped map flows through processing AND into
+    // buildRootLeaf, so the tag lands in the root CID.
+    let additionalData = withChunkingTag(additionalData)
+
     let dag = DagBuilder()
     let fm = FileManager.default
 
@@ -203,11 +208,12 @@ private func processFile(
         }
     }
 
-    // Stream file in chunks
+    // Stream file chunks under the active chunking mode (fastcdc-v1 by
+    // default, legacy fixed after setChunkSize/disableChunking).
     var singleChunk: Data? = nil
     var chunkCount = 0
 
-    try streamFileChunks(fullPath: fullPath, chunkSize: chunkSize) { chunk, index in
+    try streamChunksFromFile(fullPath: fullPath) { chunk, index in
         chunkCount += 1
 
         if chunkCount == 1 {
@@ -249,9 +255,20 @@ private func processFile(
 
 // MARK: - Stream File Chunks
 
-/// Reads a file in chunks using streaming I/O.
-/// If chunkSize <= 0, reads the entire file as a single fallback chunk.
-private func streamFileChunks(fullPath: String, chunkSize: Int, callback: (Data, Int) throws -> Void) throws {
+/// Reads a file in FIXED-SIZE chunks using streaming I/O — the legacy
+/// cutter; fastcdc streaming lives in FastCDC.swift and the mode dispatch in
+/// `streamChunksFromFile`.
+///
+/// If chunkSize <= 0, reads the entire file as a single fallback chunk —
+/// even when empty, matching Go's io.ReadAll path, which stores an explicit
+/// empty content buffer (and therefore a content hash).
+///
+/// With a positive chunkSize an empty file emits NO chunks at all, so its
+/// leaf carries no content and no content hash — matching Go's
+/// `if remaining == 0 { return nil }` and the Rust port. (This port used to
+/// emit one empty chunk here, which gave empty files a different CID than
+/// Go and Rust produce.)
+func streamFileChunks(fullPath: String, chunkSize: Int, callback: (Data, Int) throws -> Void) throws {
     let fileURL = URL(fileURLWithPath: fullPath)
 
     if chunkSize <= 0 {
@@ -266,9 +283,6 @@ private func streamFileChunks(fullPath: String, chunkSize: Int, callback: (Data,
     while true {
         let chunk = try fileHandle.read(upToCount: chunkSize) ?? Data()
         if chunk.isEmpty {
-            if index == 0 {
-                try callback(Data(), 0)
-            }
             return
         }
 
@@ -314,6 +328,10 @@ private func relativePath(from base: String, to target: String) -> String {
 // MARK: - Parallel DAG Creation
 
 private func createDagParallel(path: String, additionalData: [String: String]?, processor: LeafProcessor?, config: DagBuilderConfig) throws -> Dag {
+    // Same stamp as createDagInternal — both constructors are chunking
+    // producers, and Go stamps CreateDagParallel identically.
+    let additionalData = withChunkingTag(additionalData)
+
     let dag = DagBuilder()
     let fm = FileManager.default
 

@@ -16,6 +16,13 @@ final class EdgeTests: XCTestCase {
     }
 
     func testSingleFileScenarios() throws {
+        // The exact.bin/chunked.bin cases assert the LEGACY fixed cutter's
+        // size contract (bigger than chunkSize ⇒ child chunk leaves), so pin
+        // fixed mode; fastcdc-v1 places content-defined boundaries instead
+        // and would usually keep a 2 MiB + 9 file as one chunk.
+        setChunkSize(defaultChunkSize)
+        defer { setDefaultChunkSize() }
+
         let cases: [(String, Data)] = [
             ("empty.txt", Data()),
             ("small.txt", "small".data(using: .utf8)!),
