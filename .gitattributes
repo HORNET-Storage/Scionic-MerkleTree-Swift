@@ -1,6 +1,5 @@
-# The spec-vector corpus is byte-compared by the parity suites
-# (testManifestJSONMatchesTheCommittedBytes and friends). EOL normalization at
-# checkout — e.g. core.autocrlf=true on GitHub's Windows runners — rewrites the
-# committed LF bytes to CRLF on disk and breaks byte-identity, so conversion is
-# forbidden for the whole corpus (JSON and CBOR alike).
-spec/vectors/** -text
+# The spec vectors are compared byte for byte by the test suites. Line-ending
+# conversion at checkout (core.autocrlf=true, the default of Git for Windows and
+# of GitHub's Windows runners) rewrites the committed LF bytes to CRLF on disk
+# and breaks that comparison, so no file under spec/ is ever converted.
+spec/** -text
