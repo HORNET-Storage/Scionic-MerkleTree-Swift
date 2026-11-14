@@ -160,17 +160,48 @@ final class DiskFile: ByteSource, ByteSink {
     }
 
     #if os(Windows)
-    /// The volume and the number of the file on it, which together say which
-    /// file this is.
-    func identity() throws -> (volume: DWORD, high: DWORD, low: DWORD) {
+    /// Which file this is: the volume, and the number of the file on it. The
+    /// long form has a 128-bit number, and every volume of the newer kinds has
+    /// it. The short form has a 64-bit number, and every volume has it, but ReFS
+    /// does not promise that its short number is one file's alone.
+    func identity(long: Bool) throws -> FileIdentity {
+        if long {
+            var info = FILE_ID_INFO()
+            if !GetFileInformationByHandleEx(handle, FileIdInfo, &info, DWORD(MemoryLayout<FILE_ID_INFO>.size)) {
+                throw systemFailure(GetLastError())
+            }
+            return FileIdentity(volume: info.VolumeSerialNumber, number: withUnsafeBytes(of: info.FileId.Identifier) { Array($0) })
+        }
         var info = BY_HANDLE_FILE_INFORMATION()
         if !GetFileInformationByHandle(handle, &info) {
             throw systemFailure(GetLastError())
         }
-        return (info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow)
+        var number: [UInt8] = []
+        number.appendU32(info.nFileIndexHigh)
+        number.appendU32(info.nFileIndexLow)
+        return FileIdentity(volume: UInt64(info.dwVolumeSerialNumber), number: number)
     }
     #endif
 }
+
+#if os(Windows)
+/// Which file an open file is: a volume, and the number of the file on it.
+struct FileIdentity: Equatable {
+    let volume: UInt64
+    let number: [UInt8]
+}
+
+/// Whether two open files are one file. Both are asked in the same form: the
+/// long one where both volumes have it, and the short one otherwise. Where a
+/// file's identity is not to be had, nothing says that the two are one, and
+/// that is an error.
+func sameFile(_ left: DiskFile, _ right: DiskFile) throws -> Bool {
+    if let leftIs = try? left.identity(long: true), let rightIs = try? right.identity(long: true) {
+        return leftIs == rightIs
+    }
+    return try left.identity(long: false) == right.identity(long: false)
+}
+#endif
 
 #if !os(Windows)
 @inline(__always)
@@ -275,7 +306,7 @@ private func wide(_ path: String) -> [UInt16] {
 /// What the caller wrote is first read the way Windows reads it, which is what
 /// the caller means by it. The names that are added to it afterwards are the
 /// ones that a folder listed, and are taken as they are.
-private func exactPath(_ path: String) throws -> [UInt16] {
+func exactPath(_ path: String) throws -> [UInt16] {
     let given = wide(path)
     let length = GetFullPathNameW(given, 0, nil, nil)
     if length == 0 {
@@ -566,8 +597,7 @@ final class Held: @unchecked Sendable {
             // stands in for it from being changed into a link, which the usual
             // way of opening then follows. So what was opened has to be the
             // file that is held, and not another one.
-            let (a, b) = (try held.identity(), try usual.identity())
-            if a != b {
+            if try !sameFile(held, usual) {
                 throw Refused.link
             }
         } catch let refused as Refused {
