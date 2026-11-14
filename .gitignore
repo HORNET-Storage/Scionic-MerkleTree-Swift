@@ -6,9 +6,3 @@ DerivedData/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
 Package.resolved
-
-# Go parity tool binaries (`go build` output; named after their module dir)
-/tools/govectors/govectors
-/tools/govectors/govectors.exe
-/tools/gofixtureroots/gofixtureroots
-/tools/gofixtureroots/gofixtureroots.exe
