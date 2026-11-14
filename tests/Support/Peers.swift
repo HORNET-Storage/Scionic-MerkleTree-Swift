@@ -320,12 +320,40 @@ final class Flights: ByteSink {
         writes.append(writesNow)
         current = 0
         writesNow = 0
+        try inner.flush()
+    }
+}
+
+/// A writer that keeps what it is given until it is flushed, as a buffered
+/// writer of a program does, and then hands it on in one write.
+final class KeptSink: ByteSink {
+    private let inner: ByteSink
+    private var kept: [UInt8] = []
+
+    init(_ inner: ByteSink) {
+        self.inner = inner
+    }
+
+    func write(_ bytes: UnsafeRawBufferPointer) throws {
+        kept.append(contentsOf: bytes)
+    }
+
+    func flush() throws {
+        let out = kept
+        kept.removeAll()
+        if !out.isEmpty {
+            try inner.write(out)
+        }
+        try inner.flush()
     }
 }
 
 /// Serves `store` on a thread of its own, and runs `client` on this one, with a
 /// connection between them that holds no more than it is given: so many bytes
-/// on the way to the server, and so many on the way back.
+/// on the way to the server, and so many on the way back. `ahead` is how far the
+/// client sends requests ahead of their answers. With `buffered`, both ends read
+/// and write through buffers, as a program that uses them would: reads take as
+/// much as is there, and writes wait for a flush.
 ///
 /// It gives what the client gave, what the client sent, flight by flight, and
 /// how the serving ended.
@@ -333,18 +361,25 @@ func connected<T>(
     _ store: any Store,
     toServer: Int,
     toClient: Int,
+    ahead: Int = Scionic.requestsAheadBytes,
+    buffered: Bool = false,
     serving: @escaping @Sendable (any Store, ByteSource, ByteSink) throws -> Void = { try serve($0, from: $1, to: $2) },
     _ client: (StreamPeer) throws -> T
 ) -> (asked: Result<T, any Error>, sent: Flights, served: (any Error)?) {
     let toServerPipe = Pipe(capacity: toServer)
     let toClientPipe = Pipe(capacity: toClient)
-    let sent = Flights(toServerPipe.writer)
+    let sent = Flights(buffered ? KeptSink(toServerPipe.writer) : toServerPipe.writer)
     let served = Shared<(any Error)?>(nil)
     let done = DispatchSemaphore(value: 0)
     let lent = Unchecked(store)
     Thread.detachNewThread {
         do {
-            try serving(lent.value, toServerPipe.reader, toClientPipe.writer)
+            if buffered {
+                let input = BufferedSource(toServerPipe.reader, capacity: 4096)
+                try serving(lent.value, input, KeptSink(toClientPipe.writer))
+            } else {
+                try serving(lent.value, toServerPipe.reader, toClientPipe.writer)
+            }
         } catch {
             served.with { $0 = error }
         }
@@ -353,7 +388,8 @@ func connected<T>(
         toServerPipe.close()
         done.signal()
     }
-    let asked = Result { try client(StreamPeer(input: toClientPipe.reader, output: sent)) }
+    let input: ByteSource = buffered ? BufferedSource(toClientPipe.reader, capacity: 4096) : toClientPipe.reader
+    let asked = Result { try client(StreamPeer(input: input, output: sent, ahead: ahead)) }
     // The client hangs up, and the serving ends.
     toServerPipe.close()
     toClientPipe.close()
