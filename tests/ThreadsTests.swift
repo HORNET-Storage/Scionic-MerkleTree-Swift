@@ -143,6 +143,53 @@ private func damagedCopy(_ source: MemoryStore, _ hash: Hash) throws -> MemorySt
     return store
 }
 
+/// Bytes that look random, made quickly: a long file for a test.
+private func longBytes(_ seed: UInt64, _ length: Int) -> [UInt8] {
+    var state = seed | 1
+    var out: [UInt8] = []
+    out.reserveCapacity(length + 8)
+    while out.count < length {
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+        withUnsafeBytes(of: state.littleEndian) { out.append(contentsOf: $0) }
+    }
+    out.removeLast(out.count - length)
+    return out
+}
+
+struct DiskWentAway: Error {}
+
+/// A source that gives at most `step` bytes at a time, and fails once it has
+/// given `failsAt`.
+private final class Stutter: ByteSource {
+    private let data: [UInt8]
+    private var at = 0
+    private let step: Int
+    private let failsAt: Int
+
+    init(_ data: [UInt8], step: Int, failsAt: Int = .max) {
+        self.data = data
+        self.step = step
+        self.failsAt = failsAt
+    }
+
+    func read(into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
+        if at >= failsAt {
+            throw DiskWentAway()
+        }
+        let count = min(buffer.count, step, data.count - at)
+        data.withUnsafeBytes { buffer.copyMemory(from: UnsafeRawBufferPointer(rebasing: $0[at..<(at + count)])) }
+        at += count
+        return count
+    }
+}
+
+/// The hashes of everything a store holds, by kind.
+private func held(_ store: MemoryStore) -> [[Hash]] {
+    Stored.allCases.map { store.hashes($0) }
+}
+
 final class ThreadsTests: XCTestCase {
     func testOneFileIsTheSameWhateverNumberOfThreadsKeepItsChunks() throws {
         // 6,250 chunks of 16 bytes: more than a builder hands on at a time.
@@ -418,6 +465,49 @@ final class ThreadsTests: XCTestCase {
             out = MemorySink()
             assertFails(try exportBundle(damaged, root, to: out), "missing", "missing chunk at frame \(bad)")
             XCTAssertTrue(out.bytes == before, "missing chunk at frame \(bad)")
+        }
+    }
+
+    func testALongFileThatIsReadIsTheFileHeldInMemory() throws {
+        // Longer than a window of a builder that works alone, and than the two
+        // windows of one that has help.
+        let data = longBytes(7, 72 << 20)
+        for chunking in [Chunking.fastCDCv1, try Chunking.fixed(3 << 20)] {
+            var first: (target: Target, held: [[Hash]])?
+            for threads in [1, 3] {
+                let store = MemoryStore()
+                let builder = Builder(store: store, chunking: chunking, threads: threads)
+                let inMemory = try builder.file(bytes: data)
+                // Reads that end anywhere, and a window filled in many reads.
+                for step in [(1 << 20) + 17, 5_000_011] {
+                    let read = try builder.file(from: Stutter(data, step: step))
+                    XCTAssertEqual(read, inMemory, "\(chunking), \(threads) threads, step \(step)")
+                }
+                if let first {
+                    XCTAssertEqual(inMemory, first.target, "\(chunking), \(threads) threads")
+                    XCTAssertEqual(held(store), first.held, "\(chunking), \(threads) threads")
+                } else {
+                    first = (inMemory, held(store))
+                }
+            }
+        }
+    }
+
+    func testALongFileThatCannotBeReadOrKeptWholeHasNoList() throws {
+        let data = longBytes(11, 48 << 20)
+        let refused = try ChunkRef.of(Array(Chunking.fastCDCv1.cut(data)[2])).hash
+        for threads in [1, 3] {
+            // The reader fails in the second window, while the first is kept.
+            let store = MemoryStore()
+            let builder = Builder(store: store, chunking: .fastCDCv1, threads: threads)
+            assertFails(try builder.file(from: Stutter(data, step: 1 << 20, failsAt: 40 << 20)), "stream", "\(threads) threads")
+            XCTAssertEqual(store.count(.fileList), 0)
+
+            // The store will not keep a chunk of the first window.
+            let refusing = Refusing(refused)
+            let refusingBuilder = Builder(store: refusing, chunking: .fastCDCv1, threads: threads)
+            assertFails(try refusingBuilder.file(from: Stutter(data, step: 1 << 20)), "invariant", "\(threads) threads")
+            XCTAssertEqual(refusing.inner.count(.fileList), 0)
         }
     }
 }

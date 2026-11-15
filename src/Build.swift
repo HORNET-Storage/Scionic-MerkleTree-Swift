@@ -14,16 +14,27 @@ import Android
 #endif
 
 /// How much of a file a builder holds at a time when it works alone: two
-/// chunks of the longest kind.
+/// chunks of the longest kind, one in each of its two windows.
 private let roomAlone = 2 * FastCDC.maxSize
 
-/// How much of a file a builder holds at a time when other threads help it:
-/// enough chunks to give each of them some.
+/// How much of a file a builder holds at a time when other threads help it,
+/// in its two windows: enough chunks to give each of them some.
 private let roomWithHelp = 8 * FastCDC.maxSize
 
 /// The least of a file that is worth a thread of its own, when several threads
 /// look through it for where its chunks may end.
 private let lookedThroughByEach = 4 << 20
+
+/// The least bytes of chunks that are worth a helper of their own, while the
+/// thread that reads a file reads on.
+private let keptByEach = 1 << 20
+
+/// The most chunks of a fixed size that a window holds.
+private let fixedChunksInAWindow = 1024
+
+/// What a window holds when it starts on its first file. A window grows only as
+/// a file turns out to be longer, so a small file never costs a large one.
+private let windowStart = 64 * 1024
 
 /// How many folders' files may wait for the threads that chunk. A folder is
 /// kept open while it has files that are not chunked yet, so this bounds how
@@ -43,11 +54,12 @@ final class Unchecked<Value>: @unchecked Sendable {
 /// The threads that are free to help with a long file.
 ///
 /// Where one chunk ends decides where the next begins, so a file is chunked in
-/// order, on the thread that asks for it. A long file in memory is first looked
-/// through by the helpers that are free, each in a part of its own, for every
-/// place where a chunk may end, and is then chunked from those places alone.
-/// Hashing and keeping the chunks is the greater part of the work and needs no
-/// order, so it is shared out among that thread and the helpers that are free.
+/// order, on the thread that asks for it. A long stretch of a file is first
+/// looked through by the helpers that are free, each in a part of its own, for
+/// every place where a chunk may end, and is then chunked from those places
+/// alone. Hashing and keeping the chunks is the greater part of the work and
+/// needs no order, so it is shared out among that thread and the helpers that
+/// are free: for a file that is read, while that thread reads on.
 final class Helpers: @unchecked Sendable {
     private let lock = Lock()
     private var free: Int
@@ -99,14 +111,17 @@ public final class Builder {
     let store: any Store
     /// How this builder chunks files.
     public let chunking: Chunking
-    private let chunker = StreamChunker()
+    /// What the builder holds of a file that it reads: while the chunks of one
+    /// window are hashed and kept, the file is read on into the other.
+    private var windows = (current: Window(), next: Window())
     private let helpers: Helpers
 
     /// A builder that works on one file with `threads` threads: 1 is the
     /// calling thread alone, and zero is one thread for each core. They find
-    /// where the chunks of a file in memory end, and hash and keep the chunks
-    /// of every file. With help, a builder holds up to 64 MiB of a long file
-    /// that it reads at a time; alone it holds up to 16 MiB.
+    /// where its chunks end, and hash and keep them; for a file that is read,
+    /// while the calling thread reads on. With help, a builder holds up to
+    /// 64 MiB of a long file that it reads at a time; alone it holds up to
+    /// 16 MiB.
     public init(store: any Store, chunking: Chunking = .fastCDCv1, threads: Int = 0) {
         self.store = store
         self.chunking = chunking
@@ -121,7 +136,7 @@ public final class Builder {
 
     /// Splits everything `source` gives into chunks, keeps the chunks and the
     /// file's list, and says what the file is. The file is never held in
-    /// memory whole: only a window of it.
+    /// memory whole: only a part of it at a time, as `init` says.
     public func file(from source: any ByteSource) throws -> Target {
         try file { buffer in
             do {
@@ -161,13 +176,37 @@ public final class Builder {
         }
     }
 
+    /// Chunks, hashes and keeps a file that `read` reads, one window at a time.
+    /// While the chunks of one window are hashed and kept, what is left of it
+    /// goes to the start of the other, and the file is read on into that one.
     func file(read: (UnsafeMutableRawBufferPointer) throws -> Int) throws -> Target {
-        let room = helpers.any ? roomWithHelp : roomAlone
-        var items: [ChunkRef] = []
         let store = self.store
+        let chunking = self.chunking
         let helpers = self.helpers
-        try chunker.cut(chunking, room: room, read: read) { chunks in
-            try keepChunks(store, helpers, chunks, &items)
+        let room = windowRoom(chunking, help: helpers.any)
+        var items: [ChunkRef] = []
+        var (filled, ended) = try fill(windows.current, 0, room, read)
+        while filled > 0 {
+            let (current, next) = windows
+            let chunks = settled(chunking, helpers, UnsafeRawBufferPointer(rebasing: current.memory[..<filled]), ended: ended)
+            if chunks.isEmpty {
+                throw ScionicError.invariant("a full window settled no chunk")
+            }
+            let settledTo = chunks.reduce(0) { $0 + $1.count }
+            let tail = UnsafeRawBufferPointer(rebasing: current.memory[settledTo..<filled])
+            // Once the file has ended there is nothing to read meanwhile.
+            let most = ended ? chunks.count / 2 : (settledTo + keptByEach - 1) / keptByEach
+            let refilled = try keepChunksWhile(store, helpers, most, chunks, &items) {
+                Result<(Int, Bool), any Error> {
+                    carry(tail, into: next, room)
+                    if ended {
+                        return (tail.count, true)
+                    }
+                    return try fill(next, tail.count, room, read)
+                }
+            }
+            (filled, ended) = try refilled.get()
+            windows = (current: next, next: current)
         }
         return try keepList(items)
     }
@@ -228,18 +267,34 @@ private func keepChunks(
     _ items: inout [ChunkRef]
 ) throws {
     // A helper is worth starting only for a few chunks of its own.
-    let helping = helpers.take(chunks.count / 2)
+    try keepChunksWhile(store, helpers, chunks.count / 2, chunks, &items) {}
+}
+
+/// Hashes and keeps chunks as `keepChunks` does, with up to `most` helpers,
+/// while this thread does `meanwhile`; then this thread takes a share too.
+/// Gives what `meanwhile` gave, once the chunks are kept. A chunk that could
+/// not be kept is the error, whatever `meanwhile` gave.
+private func keepChunksWhile<T>(
+    _ store: any Store,
+    _ helpers: Helpers,
+    _ most: Int,
+    _ chunks: [UnsafeRawBufferPointer],
+    _ items: inout [ChunkRef],
+    meanwhile: () -> T
+) throws -> T {
+    let helping = helpers.take(most)
     if helping == 0 {
+        let done = meanwhile()
         for chunk in chunks {
             items.append(try keepChunk(store, chunk))
         }
-        return
+        return done
     }
     defer { helpers.give(helping) }
     let lent = Unchecked(chunks)
     let dealer = Dealer(count: chunks.count)
     let kept = Shared([ChunkRef?](repeating: nil, count: chunks.count))
-    onWorkers(helping + 1) { _ in
+    let work: @Sendable () -> Void = {
         while let index = dealer.take() {
             do {
                 let item = try keepChunk(store, lent.value[index])
@@ -249,6 +304,13 @@ private func keepChunks(
             }
         }
     }
+    let group = DispatchGroup()
+    for _ in 0..<helping {
+        DispatchQueue.global().async(group: group, execute: work)
+    }
+    let done = meanwhile()
+    work()
+    group.wait()
     try dealer.check()
     for item in kept.with({ $0 }) {
         guard let item else {
@@ -256,6 +318,7 @@ private func keepChunks(
         }
         items.append(item)
     }
+    return done
 }
 
 /// The chunks of `data`, the start of what is left of a file, that are
@@ -288,6 +351,77 @@ private func settled(
         start += length
     }
     return chunks
+}
+
+/// The most bytes one of a builder's two windows holds: half of what the
+/// builder may hold, and never less than one chunk of the longest kind.
+private func windowRoom(_ chunking: Chunking, help: Bool) -> Int {
+    let room = help ? roomWithHelp : roomAlone
+    guard let size = chunking.fixedSize.map(Int.init) else {
+        return max(room / 2, FastCDC.maxSize)
+    }
+    let (most, overflow) = size.multipliedReportingOverflow(by: fixedChunksInAWindow)
+    return max(min(room / 2, overflow ? Int.max : most), size)
+}
+
+/// One of the two windows a builder holds a file that it reads in.
+private final class Window {
+    private(set) var memory = UnsafeMutableRawBufferPointer(start: nil, count: 0)
+
+    deinit {
+        memory.deallocate()
+    }
+
+    /// Makes the window at least `least` bytes long: twice as long as it was,
+    /// and no longer than `room` unless `least` is longer. What it held stays.
+    func grow(least: Int, room: Int) {
+        let length = max(min(max(memory.count * 2, windowStart), room), least)
+        guard length > memory.count else {
+            return
+        }
+        let larger = UnsafeMutableRawBufferPointer.allocate(byteCount: length, alignment: 16)
+        if memory.count > 0 {
+            larger.copyMemory(from: UnsafeRawBufferPointer(memory))
+        }
+        memory.deallocate()
+        memory = larger
+    }
+}
+
+/// Reads into `window` from `filled` on, until it holds `room` bytes or the file
+/// has ended. Gives how many bytes it holds, and whether the file has ended.
+private func fill(
+    _ window: Window,
+    _ filled: Int,
+    _ room: Int,
+    _ read: (UnsafeMutableRawBufferPointer) throws -> Int
+) throws -> (Int, Bool) {
+    var filled = filled
+    while filled < room {
+        if filled == window.memory.count {
+            window.grow(least: filled + 1, room: room)
+        }
+        let end = min(window.memory.count, room)
+        let count = try read(UnsafeMutableRawBufferPointer(rebasing: window.memory[filled..<end]))
+        guard count >= 0, count <= end - filled else {
+            throw ScionicError.invariant("a reader gave more bytes than it was asked for")
+        }
+        if count == 0 {
+            return (filled, true)
+        }
+        filled += count
+    }
+    return (filled, false)
+}
+
+/// Puts `tail`, what is left of one window, at the start of the other.
+private func carry(_ tail: UnsafeRawBufferPointer, into window: Window, _ room: Int) {
+    if window.memory.count < tail.count {
+        window.grow(least: tail.count, room: room)
+    }
+    if let from = tail.baseAddress, let to = window.memory.baseAddress {
+        to.copyMemory(from: from, byteCount: tail.count)
+    }
 }
 
 /// What a builder does with a link or a special file that it finds in a folder.
