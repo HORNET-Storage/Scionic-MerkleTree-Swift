@@ -561,12 +561,18 @@ private final class Waiting: @unchecked Sendable {
     /// One signal for each file that is added, and one for each thread when
     /// the walk is over or the build has failed.
     private let more = DispatchSemaphore(value: 0)
-    /// One signal for each folder that may still be added.
-    private let room = DispatchSemaphore(value: foldersAhead)
+    /// One signal for each folder that may still be added. It starts at none,
+    /// and is given its folders in `init`: the system ends the whole program
+    /// when a semaphore is let go of with fewer signals than it started with,
+    /// and a build that fails lets go of it with folders still waiting.
+    private let room = DispatchSemaphore(value: 0)
     private let threads: Int
 
     init(threads: Int) {
         self.threads = threads
+        for _ in 0..<foldersAhead {
+            room.signal()
+        }
     }
 
     var hasFailed: Bool {

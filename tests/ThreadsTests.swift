@@ -30,6 +30,27 @@ private final class Refusing: Store, @unchecked Sendable {
     }
 }
 
+/// A store that falls over whenever it is handed a chunk, but takes a while to.
+private final class SlowToFall: Store, @unchecked Sendable {
+    let inner = MemoryStore()
+
+    func put(_ kind: Stored, _ hash: Hash, _ bytes: UnsafeRawBufferPointer) throws {
+        if kind == .chunk {
+            Thread.sleep(forTimeInterval: 0.05)
+            throw FellOver()
+        }
+        try inner.put(kind, hash, bytes)
+    }
+
+    func get(_ kind: Stored, _ hash: Hash) throws -> [UInt8]? {
+        try inner.get(kind, hash)
+    }
+
+    func remove(_ kind: Stored, _ hash: Hash) throws {
+        try inner.remove(kind, hash)
+    }
+}
+
 final class ThreadsTests: XCTestCase {
     func testOneFileIsTheSameWhateverNumberOfThreadsKeepItsChunks() throws {
         // 6,250 chunks of 16 bytes: more than a builder hands on at a time.
@@ -151,6 +172,26 @@ final class ThreadsTests: XCTestCase {
         for workers in [1, 2, 8] {
             let what = "a check with \(workers) workers"
             assertFell(endsWithin(what) { try verify(FallingOnGet(store), root, options: VerifyOptions(workers: workers)) }, what)
+        }
+    }
+
+    func testABuildThatFailsWithFoldersStillWaitingEndsCleanly() throws {
+        // The thread that reads the folder runs ahead of the threads that chunk,
+        // by up to 16 folders. Here the store is slow to fall over, so that the
+        // walk is that far ahead when the build fails, and the folders that wait
+        // are let go of at once. A build that lost count of them there ended
+        // the whole program, on Linux and on Apple's systems.
+        let temp = try TempDir("threads-slow-falling")
+        let folder = temp.join("tree")
+        for number in 0..<400 {
+            try writeFile(folder + "/dir-\(number % 40)/file-\(padded(number, 3))", corpusBytes("slow-falling-\(number)", 16))
+        }
+        for workers in [2, 8] {
+            var options = smallOptions()
+            options.workers = workers
+            let what = "a build with \(workers) workers"
+            assertFell(endsWithin(what) { [options] in try build(SlowToFall(), path: folder, options: options) }, what)
+            XCTAssertNoThrow(try movable(folder), "\(what): the folder is still held after the build fell over")
         }
     }
 }
