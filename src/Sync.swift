@@ -274,11 +274,12 @@ public final class Responder: Peer, @unchecked Sendable {
     /// thread that finds the frame in use, by another thread or by an answer
     /// that this one is still giving, is given a frame of its own.
     private func withFrame(_ body: (inout [UInt8]) throws -> Void) rethrows {
-        let spare: [UInt8]? = spareFrame.with { kept in
+        // Taken out of its place, so that this is the frame's only owner, and
+        // filling it again needs no new memory.
+        var frame = spareFrame.with { kept -> [UInt8] in
             defer { kept = nil }
-            return kept
+            return kept ?? []
         }
-        var frame: [UInt8] = spare ?? []
         defer {
             spareFrame.with { kept in
                 if kept == nil {

@@ -102,8 +102,9 @@ final class ResponderTests: XCTestCase {
     // A responder fills one frame again for every chunk it sends, from one
     // request to the next. What it sends is the chunk that was asked for and
     // nothing of a longer one before it, a frame that was kept is not changed by
-    // the next, and a request that is answered inside the answer to another is
-    // given a frame of its own.
+    // the next, a request that is answered inside the answer to another is
+    // given a frame of its own, and a frame that nobody kept is filled again in
+    // the same memory.
     func testAFrameThatIsFilledAgainHoldsTheChunkAskedForAlone() throws {
         let store = MemoryStore()
         let long = corpusBytes("frame-long", 4_000)
@@ -130,6 +131,19 @@ final class ResponderTests: XCTestCase {
         }
         XCTAssertEqual(outer, chunkFrame(long))
         XCTAssertEqual(inner, chunkFrame(short))
+
+        // A frame that nobody kept is filled again where it is.
+        func place(_ chunk: [UInt8]) throws -> UnsafeRawPointer? {
+            var at: UnsafeRawPointer?
+            try responder.answer(ask(chunk)) { frame in
+                at = frame.withUnsafeBytes { $0.baseAddress }
+            }
+            return at
+        }
+        let first = try place(long)
+        XCTAssertNotNil(first)
+        XCTAssertEqual(try place(short), first)
+        XCTAssertEqual(try place(long), first)
     }
 
     func testAListReadWithItsTreeIsTheListReadAlone() throws {
