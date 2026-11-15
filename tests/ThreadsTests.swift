@@ -226,8 +226,66 @@ private func badPeer(_ store: MemoryStore, bad: Hash?, overlongAt: UInt64? = nil
 /// The frames of a responder's answer to a request for chunks.
 private func chunksAnswer(_ responder: Responder, _ file: Hash, _ start: UInt64) throws -> [[UInt8]] {
     var frames: [[UInt8]] = []
-    try responder.answer(Request.chunks(file: file, start: start, count: 256).encode()) { frames.append($0) }
+    try responder.answer(Request.chunks(file: file, start: start, count: 256).encode()) { frames.append(Array($0)) }
     return frames
+}
+
+/// A store that holds what `source` holds.
+private func copyOf(_ source: MemoryStore) throws -> MemoryStore {
+    let store = MemoryStore()
+    for kind in Stored.allCases {
+        for held in source.hashes(kind) {
+            try store.put(kind, held, try XCTUnwrap(source.get(kind, held)))
+        }
+    }
+    return store
+}
+
+/// A store that reads things into the caller's memory itself, as a store on
+/// disk does. It can hand out one chunk damaged, say it lacks one that it
+/// holds, or say it read one into the caller's memory and write nothing there.
+private final class ReadingInto: Store, @unchecked Sendable {
+    let inner: MemoryStore
+    private let damaged: Hash?
+    private let lost: Hash?
+    private let unwritten: Hash?
+    let reads = Shared(0)
+
+    init(_ inner: MemoryStore, damaged: Hash? = nil, lost: Hash? = nil, unwritten: Hash? = nil) {
+        self.inner = inner
+        self.damaged = damaged
+        self.lost = lost
+        self.unwritten = unwritten
+    }
+
+    func put(_ kind: Stored, _ hash: Hash, _ bytes: UnsafeRawBufferPointer) throws {
+        try inner.put(kind, hash, bytes)
+    }
+
+    func get(_ kind: Stored, _ hash: Hash) throws -> [UInt8]? {
+        try inner.get(kind, hash)
+    }
+
+    func readInto(_ kind: Stored, _ hash: Hash, _ into: UnsafeMutableRawBufferPointer) throws -> UInt64? {
+        reads.with { $0 += 1 }
+        if hash == lost {
+            return nil
+        }
+        guard let bytes = try inner.get(kind, hash) else {
+            return nil
+        }
+        if bytes.count == into.count && hash != unwritten {
+            bytes.withUnsafeBytes { into.copyMemory(from: $0) }
+            if hash == damaged {
+                into[0] ^= 1
+            }
+        }
+        return UInt64(bytes.count)
+    }
+
+    func remove(_ kind: Stored, _ hash: Hash) throws {
+        try inner.remove(kind, hash)
+    }
 }
 
 final class ThreadsTests: XCTestCase {
@@ -653,6 +711,11 @@ final class ThreadsTests: XCTestCase {
         let third = Hash.of(chunks[2].dropFirst())
         let missing = try damagedCopy(source, third)
         try missing.remove(.chunk, third)
+        // The third chunk is held with another length than its list gives: it
+        // cannot be the chunk, and the answer is the same.
+        let shortened = try damagedCopy(source, third)
+        try shortened.remove(.chunk, third)
+        try shortened.put(.chunk, third, Array(chunks[2].dropFirst().dropLast()))
         let cutShort = Array(chunks[..<2]) + [notHeld]
         for threads in [1, 2, 0] {
             let responder = Responder(source, threads: threads)
@@ -661,6 +724,8 @@ final class ThreadsTests: XCTestCase {
             let lacking = Responder(missing, threads: threads)
             XCTAssertTrue(try chunksAnswer(lacking, file, 0) == cutShort, "\(threads) threads")
             XCTAssertTrue(try chunksAnswer(lacking, file, 2) == [notHeld], "\(threads) threads")
+            let short = Responder(shortened, threads: threads)
+            XCTAssertTrue(try chunksAnswer(short, file, 0) == cutShort, "\(threads) threads")
         }
         // Several threads asking one responder at once are each answered whole.
         let responder = Responder(source)
@@ -671,5 +736,155 @@ final class ThreadsTests: XCTestCase {
             }
         }
         XCTAssertEqual(wrong.with { $0 }, 0, "answers that were not whole")
+    }
+
+    func testChunkFramesTakeNoMoreMemoryThanOneBatchNeeds() throws {
+        // In each batch a long frame comes after short ones, at another place
+        // each time. Memory that each place kept for the longest frame it held
+        // would come to all of them: 128 MiB.
+        let intake = try Intake(store: MemoryStore(), root: Root.of(record: bytes("no such tree")))
+        let long = [UInt8](repeating: FrameTag.chunk, count: (1 << 20) + 1)
+        let short: [UInt8] = [FrameTag.chunk, 1]
+        let places = 128
+        // Room for a batch and the frame that ends it, give or take what the
+        // system rounds memory up to.
+        let most = ChunkFrames.room + (64 << 10)
+        XCTAssertGreaterThan(places << 20, most)
+        // Held as a fetch holds them.
+        let held = ChunkFrames()
+        for place in 0..<places {
+            for _ in 0..<place {
+                short.withUnsafeBytes { held.holdCopy($0, nil) }
+            }
+            long.withUnsafeBytes { held.holdCopy($0, nil) }
+            // The intake has no record and takes no chunk, and the batch is
+            // let go all the same.
+            XCTAssertThrowsError(try held.takeIn(intake))
+        }
+        XCTAssertLessThanOrEqual(held.memoryHeld, most)
+        // Read as an import reads them.
+        let read = ChunkFrames()
+        for place in 0..<places {
+            var stream: [UInt8] = []
+            for frame in Array(repeating: short, count: place) + [long] {
+                stream.appendU32(UInt32(frame.count))
+                stream.append(contentsOf: frame)
+            }
+            let source = BytesSource(stream)
+            while try read.readNext(source, limit: long.count) == .frame {
+                XCTAssertTrue(read.nextIsChunk)
+                read.hold(nil)
+            }
+            XCTAssertEqual(read.count, place + 1)
+            XCTAssertThrowsError(try read.takeIn(intake))
+        }
+        XCTAssertLessThanOrEqual(read.memoryHeld, most)
+    }
+
+    func testAStoreThatSaysItReadAChunkItDidNotReadSendsNothingElse() throws {
+        // A store says it read a chunk into the memory it was given, and wrote
+        // nothing there. What is sent for it holds nothing that was in that
+        // memory before: the receiver finds it is not the chunk, and nothing
+        // else is told. Memory of its length that was given back last held
+        // something else, and is likely to be handed out again.
+        let store = MemoryStore()
+        let chunk = [UInt8](repeating: 7, count: 100)
+        let item = try ChunkRef.of(chunk)
+        try store.put(.chunk, item.hash, chunk)
+        let lying = ReadingInto(store, unwritten: item.hash)
+        let before = UnsafeMutableRawBufferPointer.allocate(byteCount: chunk.count + 1, alignment: 1)
+        before.initializeMemory(as: UInt8.self, repeating: 0xAA)
+        before.deallocate()
+        var given: [[UInt8]?] = []
+        try ChunksAhead(threads: 1).frames(lying, [item][...]) { given.append($0.map { Array($0) }) }
+        XCTAssertEqual(given, [[FrameTag.chunk] + [UInt8](repeating: 0, count: chunk.count)])
+    }
+
+    func testChunksReadAheadTakeNoMoreMemoryThanTheLongestBatch() throws {
+        // In each batch a long chunk comes after short ones, at another place
+        // each time. Memory that each place kept for the longest chunk it held
+        // would come to all of them.
+        let store = MemoryStore()
+        let longBytes = [UInt8](repeating: 7, count: 1 << 20)
+        let long = try ChunkRef.of(longBytes)
+        try store.put(.chunk, long.hash, longBytes)
+        let short = try ChunkRef.of(bytes("s"))
+        try store.put(.chunk, short.hash, bytes("s"))
+        let ahead = ChunksAhead(threads: 4)
+        for place in 0..<64 {
+            let items = Array(repeating: short, count: place) + [long]
+            var given: [Int?] = []
+            try ahead.frames(store, items[...]) { given.append($0?.count) }
+            XCTAssertEqual(given, items.map { Int($0.length) + 1 })
+            // Checked, every eighth time: each check hashes the long chunk.
+            if place % 8 == 0 {
+                var lent: [Int] = []
+                try ahead.lend(store, items[...]) { _, bytes in lent.append(bytes.count) }
+                XCTAssertEqual(lent, items.map { Int($0.length) })
+            }
+        }
+        XCTAssertLessThanOrEqual(ahead.memoryHeld, longBytes.count + 1 + 64 * 2)
+    }
+
+    func testWhatAStoreReadsIntoMemoryOfItsOwnIsCheckedAsWhatItLends() throws {
+        // By default, a thing is read into memory as long as it is, and only its
+        // length is told for memory of another length.
+        let store = MemoryStore()
+        try store.put(.chunk, Hash.of(bytes("held")), bytes("held"))
+        var into = bytes("....")
+        XCTAssertEqual(try into.withUnsafeMutableBytes { try store.readInto(.chunk, Hash.of(bytes("held")), $0) }, 4)
+        XCTAssertEqual(into, bytes("held"))
+        var longer = bytes(".....")
+        XCTAssertEqual(try longer.withUnsafeMutableBytes { try store.readInto(.chunk, Hash.of(bytes("held")), $0) }, 4)
+        XCTAssertEqual(longer, bytes("....."))
+        XCTAssertNil(try into.withUnsafeMutableBytes { try store.readInto(.chunk, Hash.of(bytes("not held")), $0) })
+
+        let (source, root, frames) = try longTree("threads-read-into")
+        let places = chunkPlaces(frames)
+        let file = try recordOf(source, root).top
+        let bad = Hash.of(frames[places[2]].dropFirst())
+        let before = bundleOf(Array(frames[..<places[2]]))
+
+        // A sound store is read through its own way, and gives what the store in
+        // memory gives.
+        let reading = ReadingInto(try copyOf(source))
+        let out = MemorySink()
+        try exportBundle(reading, root, to: out)
+        XCTAssertTrue(out.bytes == bundleOf(frames))
+        XCTAssertGreaterThanOrEqual(reading.reads.with { $0 }, places.count)
+        let fetched = MemoryStore()
+        try fetch(fetched, root, from: Responder(reading))
+        XCTAssertEqual(try contents(fetched), try contents(source))
+
+        // A chunk it reads damaged is found, whoever reads it.
+        let damaged = ReadingInto(try copyOf(source), damaged: bad)
+        let damagedOut = MemorySink()
+        assertFails(try exportBundle(damaged, root, to: damagedOut), "corrupt")
+        XCTAssertTrue(damagedOut.bytes == before)
+        assertFails(try readFile(damaged, file, to: MemorySink()), "corrupt")
+        assertFails(try fetch(MemoryStore(), root, from: Responder(damaged)), "notWanted")
+
+        // A chunk it cannot find is missing.
+        let lost = ReadingInto(try copyOf(source), lost: bad)
+        assertFails(try exportBundle(lost, root, to: MemorySink()), "missing")
+        assertFails(try readFile(lost, file, to: MemorySink()), "missing")
+
+        // A chunk it holds with another length than its list gives is not read
+        // into the memory laid out for it, by it or by default. Read to be
+        // checked, it is damaged; to be sent, it is not held. A file that is
+        // read out has the lengths of its chunks looked at before any of it is
+        // written.
+        let shortened = ReadingInto(try copyOf(source))
+        try shortened.inner.remove(.chunk, bad)
+        try shortened.inner.put(.chunk, bad, Array(frames[places[2]].dropFirst().dropLast()))
+        for store in [shortened as any Store, shortened.inner] {
+            let out = MemorySink()
+            assertFails(try exportBundle(store, root, to: out), "corrupt")
+            XCTAssertTrue(out.bytes == before)
+            let read = MemorySink()
+            assertFails(try readFile(store, file, to: read), "sizeMismatch")
+            XCTAssertTrue(read.bytes.isEmpty)
+            assertFails(try fetch(MemoryStore(), root, from: Responder(store)), "peer")
+        }
     }
 }

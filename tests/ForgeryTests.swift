@@ -520,6 +520,17 @@ final class ForgeryTests: XCTestCase {
         }
         XCTAssertNotNil(failure(result))
 
+        // A chunk that holds nothing, in its place: it is not a chunk at all,
+        // whoever takes it, and nothing of a stretch is handed out after it.
+        (result, _) = try fetchTampered(source, root) { _, frames in
+            frames.map { $0[0] == FrameTag.chunk && Hash.of(Array($0[1...])) == last.hash ? [FrameTag.chunk] : $0 }
+        }
+        XCTAssertEqual(failure(result)?.caseName, "invalidData")
+        let emptied = try Remote(peer: TestPeer(source) { request, frames in request[0] == 0x37 ? [[FrameTag.chunk]] + frames.dropFirst() : frames }, root: root)
+        out = BytesSink()
+        assertFails(try emptied.read(model, offset: 0, length: 1_000, to: out), "invalidData")
+        XCTAssertTrue(out.bytes.isEmpty)
+
         // A made-up file that is the real one without its last chunk. It is whole
         // and well formed, it is shorter, and it is another file.
         let shorter = list.items.prefix(62).map { Oracle.Item(hash: $0.hash.bytes, length: $0.length) }

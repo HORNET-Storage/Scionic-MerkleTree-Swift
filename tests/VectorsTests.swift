@@ -529,7 +529,7 @@ final class VectorsTests: XCTestCase {
             XCTAssertEqual(try Request(decoding: request).encode(), request, "\(asked.what): the request does not read back")
             kinds.insert(request[0])
             var frames: [String] = []
-            try Responder(sample.store).answer(request) { frames.append(hexText($0)) }
+            try Responder(sample.store).answer(request) { frames.append(hexText(Array($0))) }
             XCTAssertEqual(frames, asked.frames, asked.what)
             for frame in asked.frames {
                 _ = try Frame(decoding: hexBytes(frame))
@@ -568,7 +568,7 @@ final class VectorsTests: XCTestCase {
         var got = [[String]](repeating: [], count: requests.count)
         let (asked, wrote, served) = connected(sample.store, toServer: Scionic.requestsAheadBytes, toClient: 1) { peer in
             try peer.askAll(requests) { place, frame in
-                got[place].append(hexText(frame))
+                got[place].append(hexText(Array(frame)))
             }
         }
         XCTAssertNoThrow(try asked.get())

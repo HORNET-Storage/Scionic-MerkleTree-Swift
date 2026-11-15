@@ -87,7 +87,7 @@ final class ResponderTests: XCTestCase {
         let request = Request.have(file.hash).encode()
         func answer(_ responder: Responder) throws -> Frame {
             var frames: [[UInt8]] = []
-            try responder.answer(request) { frames.append($0) }
+            try responder.answer(request) { frames.append(Array($0)) }
             XCTAssertEqual(frames.count, 1)
             return try Frame(decoding: frames[0])
         }
@@ -118,16 +118,16 @@ final class ResponderTests: XCTestCase {
         let responder = Responder(store)
         var sent: [[UInt8]] = []
         for chunk in [long, short, long, short] {
-            try responder.answer(ask(chunk)) { sent.append($0) }
+            try responder.answer(ask(chunk)) { sent.append(Array($0)) }
         }
         XCTAssertEqual(sent, [long, short, long, short].map { chunkFrame($0) })
 
         var outer: [UInt8] = []
         var inner: [UInt8] = []
         try responder.answer(ask(long)) { frame in
-            try responder.answer(ask(short)) { inner = $0 }
+            try responder.answer(ask(short)) { inner = Array($0) }
             // The answer inside left this frame as it was.
-            outer = frame
+            outer = Array(frame)
         }
         XCTAssertEqual(outer, chunkFrame(long))
         XCTAssertEqual(inner, chunkFrame(short))
@@ -136,7 +136,7 @@ final class ResponderTests: XCTestCase {
         func place(_ chunk: [UInt8]) throws -> UnsafeRawPointer? {
             var at: UnsafeRawPointer?
             try responder.answer(ask(chunk)) { frame in
-                at = frame.withUnsafeBytes { $0.baseAddress }
+                at = frame.baseAddress
             }
             return at
         }

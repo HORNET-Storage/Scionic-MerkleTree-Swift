@@ -121,18 +121,18 @@ final class TestPeer: Peer {
         self.tamper = tamper
     }
 
-    func ask(_ request: [UInt8], limit: Int, onFrame: ([UInt8]) throws -> Void) throws {
+    func ask(_ request: [UInt8], limit: Int, onFrame: (UnsafeRawBufferPointer) throws -> Void) throws {
         wire.requests.append(request)
         wire.limits.append(limit)
         var frames: [[UInt8]] = []
-        try responder.answer(request) { frames.append($0) }
+        try responder.answer(request) { frames.append(Array($0)) }
         if let tamper {
             frames = tamper(request, frames)
         }
         for frame in frames {
             wire.frames.append(frame)
             try testWithin(limit, frame)
-            try onFrame(frame)
+            try frame.withUnsafeBytes(onFrame)
         }
     }
 }
@@ -145,10 +145,10 @@ final class ScriptedPeer: Peer {
         self.script = script
     }
 
-    func ask(_ request: [UInt8], limit: Int, onFrame: ([UInt8]) throws -> Void) throws {
+    func ask(_ request: [UInt8], limit: Int, onFrame: (UnsafeRawBufferPointer) throws -> Void) throws {
         for frame in script(request) {
             try testWithin(limit, frame)
-            try onFrame(frame)
+            try frame.withUnsafeBytes(onFrame)
         }
     }
 }

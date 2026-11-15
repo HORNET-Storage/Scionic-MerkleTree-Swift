@@ -296,7 +296,7 @@ final class SyncTests: XCTestCase {
         let responder = Responder(source)
         func answer(_ request: Request) throws -> [[UInt8]] {
             var frames: [[UInt8]] = []
-            try responder.answer(request.encode()) { frames.append($0) }
+            try responder.answer(request.encode()) { frames.append(Array($0)) }
             return frames
         }
         func refused(_ request: Request, _ why: Refusal) throws {

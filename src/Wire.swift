@@ -400,6 +400,12 @@ func readSome(_ source: any ByteSource, _ buffer: UnsafeMutableRawBufferPointer)
 
 /// Writes one frame to a stream: its length as four bytes, then the frame.
 public func writeFrame(_ sink: any ByteSink, _ frame: [UInt8]) throws {
+    try frame.withUnsafeBytes { try writeFrame(sink, $0) }
+}
+
+/// Writes one frame, which is lent for the call only, to a stream: its length
+/// as four bytes, then the frame.
+public func writeFrame(_ sink: any ByteSink, _ frame: UnsafeRawBufferPointer) throws {
     guard frame.count <= Int(UInt32.max) else {
         throw ScionicError.limitExceeded(what: "a frame", limit: UInt64(UInt32.max), requested: UInt64(frame.count))
     }
@@ -464,14 +470,29 @@ func writeEnd(_ sink: any ByteSink) throws {
 /// as they come, a megabyte at a time, so that what a peer only says it will
 /// send costs nothing until it is sent.
 func readNext(_ source: any ByteSource, limit: Int, into frame: inout [UInt8]) throws -> Next {
+    frame.removeAll(keepingCapacity: true)
+    return try readNextOnto(source, limit: limit, frames: &frame)
+}
+
+/// Reads what comes next on a stream as `readNext` does, and adds a frame to
+/// the end of `frames`, after what they hold already. Nothing is added unless
+/// a whole frame is.
+func readNextOnto(_ source: any ByteSource, limit: Int, frames: inout [UInt8]) throws -> Next {
+    let start = frames.count
     do {
-        return try readNextFrom(source, limit: limit, into: &frame)
+        let next = try readNextFrom(source, limit: limit, onto: &frames)
+        if next != .frame {
+            frames.removeSubrange(start...)
+        }
+        return next
     } catch {
+        frames.removeSubrange(start...)
         throw streamFailure(error, "read a frame")
     }
 }
 
-private func readNextFrom(_ source: any ByteSource, limit: Int, into frame: inout [UInt8]) throws -> Next {
+/// Reads what comes next on a stream, a frame onto the end of `frames`.
+private func readNextFrom(_ source: any ByteSource, limit: Int, onto frames: inout [UInt8]) throws -> Next {
     let cutShort = invalid("a stream ends inside a frame")
     var header: (UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0)
     let ended = try withUnsafeMutableBytes(of: &header) { header -> Bool in
@@ -492,12 +513,15 @@ private func readNextFrom(_ source: any ByteSource, limit: Int, into frame: inou
     guard length <= limit else {
         throw ScionicError.limitExceeded(what: "a frame", limit: UInt64(limit), requested: UInt64(length))
     }
-    frame.removeAll(keepingCapacity: true)
-    while frame.count < length {
-        let held = frame.count
-        let more = min(length - held, readStepBytes)
-        frame.append(contentsOf: repeatElement(0, count: more))
-        try frame.withUnsafeMutableBytes { raw in
+    let (end, past) = frames.count.addingReportingOverflow(length)
+    guard !past else {
+        throw ScionicError.limitExceeded(what: "a frame", limit: UInt64(limit), requested: UInt64(length))
+    }
+    while frames.count < end {
+        let held = frames.count
+        let more = min(end - held, readStepBytes)
+        frames.append(contentsOf: repeatElement(0, count: more))
+        try frames.withUnsafeMutableBytes { raw in
             try readExactly(source, UnsafeMutableRawBufferPointer(rebasing: raw[held...]), endsEarly: cutShort)
         }
     }

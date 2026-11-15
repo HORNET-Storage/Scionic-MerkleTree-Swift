@@ -9,6 +9,18 @@
 // Everything that this library puts into a store is checked first, and
 // everything it takes out is checked again before it is used.
 
+#if os(Windows)
+import ucrt
+#elseif canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Android)
+import Android
+#endif
+
 /// The kinds of thing a store keeps.
 public enum Stored: UInt8, Hashable, Sendable, Comparable, CaseIterable {
     /// A chunk's bytes, under the SHA-256 of them.
@@ -30,7 +42,7 @@ public enum Stored: UInt8, Hashable, Sendable, Comparable, CaseIterable {
 /// A store that can say how long a thing is without reading it should have its
 /// own `size`: a store on disk above all. Without it, seeing whether a chunk is
 /// there takes a read of the whole chunk. A store on disk should have its own
-/// `lend` too.
+/// `lend` and `readInto` too.
 public protocol Store: AnyObject, Sendable {
     /// Keeps `bytes` under `hash`. Keeping what is kept already changes nothing.
     /// The bytes are lent for the call only: a store that keeps them keeps a
@@ -50,6 +62,18 @@ public protocol Store: AnyObject, Sendable {
     /// memory for every chunk, and some systems take longer to give that than
     /// the reading takes. Unless a store has its own, this asks `get`.
     func lend(_ kind: Stored, _ hash: Hash, to body: (UnsafeRawBufferPointer) throws -> Void) throws -> Bool
+
+    /// Reads what is kept under `hash` into `into`, when it is as long as `into`
+    /// is, and says how long it is: nil when nothing is kept. A thing of another
+    /// length is not read, and `into` is left as it was.
+    ///
+    /// The library reads chunks this way where it holds them a while: to send
+    /// them, or to read several at once. Their lists say how long they are, so
+    /// they are read one after another into memory that serves one batch after
+    /// another. A store on disk should have its own, which looks at how long a
+    /// thing is before it reads any of it, and reads it straight into `into`.
+    /// Unless a store has its own, this asks `lend` and copies what is lent.
+    func readInto(_ kind: Stored, _ hash: Hash, _ into: UnsafeMutableRawBufferPointer) throws -> UInt64?
 
     /// Whether anything is kept under `hash`. Unless a store has its own, this
     /// asks how long the thing is, so a store that can say that without reading
@@ -78,6 +102,17 @@ extension Store {
         }
         try bytes.withUnsafeBytes(body)
         return true
+    }
+
+    public func readInto(_ kind: Stored, _ hash: Hash, _ into: UnsafeMutableRawBufferPointer) throws -> UInt64? {
+        var length: UInt64?
+        let held = try lend(kind, hash) { bytes in
+            length = UInt64(bytes.count)
+            if bytes.count == into.count {
+                into.copyMemory(from: bytes)
+            }
+        }
+        return held ? length : nil
     }
 
     /// Keeps `bytes` under `hash`.
@@ -216,6 +251,16 @@ func checkChunk(_ item: ChunkRef, _ bytes: ArraySlice<UInt8>, _ what: String) th
     }
 }
 
+/// Whether `bytes`, which are lent, are the chunk that `item` names.
+func checkChunk(_ item: ChunkRef, _ bytes: UnsafeRawBufferPointer, _ what: String) throws {
+    guard bytes.count == Int(item.length) else {
+        throw ScionicError.sizeMismatch(what: what, expected: UInt64(item.length), actual: UInt64(bytes.count))
+    }
+    guard Hash.of(bytes) == item.hash else {
+        throw ScionicError.hashMismatch(what: what)
+    }
+}
+
 /// Has `store` lend the thing under `hash` to `body`, and holds the store to what
 /// `Store.lend` promises: one call when it says it holds the thing, and none
 /// when it says it does not. An error from `body` is thrown whatever the store
@@ -299,35 +344,88 @@ private enum Ahead {
     case framed
 }
 
-/// Memory that a chunk is read into, by one thread at a time.
-private final class ChunkBuffer: @unchecked Sendable {
-    var bytes: [UInt8] = []
+/// How many bytes a chunk takes when it is read ahead as `ahead` says.
+private func slotLength(_ item: ChunkRef, _ ahead: Ahead) -> Int {
+    Int(item.length) + (ahead == .framed ? 1 : 0)
 }
 
-/// Reads the chunk that `item` names into `buffer`, from its start, as `ahead`
-/// says, and says whether the store holds it.
-private func readInto(_ store: any Store, _ item: ChunkRef, _ ahead: Ahead, _ buffer: inout [UInt8]) throws -> Bool {
-    buffer.removeAll(keepingCapacity: true)
-    if ahead == .framed {
-        buffer.append(FrameTag.chunk)
+/// Reads the chunk that `item` names into `slot`, which is as long as
+/// `slotLength` gives, as `ahead` says, and says whether the store holds it. A
+/// chunk that the store holds with another length than `item` gives is not
+/// read into `slot`. Read to be checked, it is lent and checked whole instead,
+/// which tells whether it is damaged or `item` is wrong. Read to be sent, it is
+/// not held: it cannot be the chunk.
+private func readSlot(_ store: any Store, _ item: ChunkRef, _ ahead: Ahead, _ slot: UnsafeMutableRawBufferPointer) throws -> Bool {
+    let length = UInt64(item.length)
+    switch ahead {
+    case .checked:
+        switch try store.readInto(.chunk, item.hash, slot) {
+        case nil:
+            return false
+        case length?:
+            try checkStoredChunk(item, UnsafeRawBufferPointer(slot))
+            return true
+        case _?:
+            guard try lendChunk(store, item, to: { _ in }) else {
+                return false
+            }
+            throw ScionicError.invariant("a store gave two lengths for one chunk")
+        }
+    case .framed:
+        guard !slot.isEmpty else {
+            throw ScionicError.invariant("a chunk's frame has no room for its tag")
+        }
+        slot[0] = FrameTag.chunk
+        return try store.readInto(.chunk, item.hash, UnsafeMutableRawBufferPointer(rebasing: slot[1...])) == length
     }
-    let held = try lent(store, .chunk, item.hash) { buffer.append(contentsOf: $0) }
-    if held && ahead == .checked {
-        try buffer.withUnsafeBytes { try checkStoredChunk(item, $0) }
+}
+
+/// Memory that the chunks of a batch are read into, one after another. It is
+/// cleared when it is taken, so that nothing that was in this memory before is
+/// ever read out of it.
+private final class AheadMemory: @unchecked Sendable {
+    private(set) var bytes = UnsafeMutableRawBufferPointer(start: nil, count: 0)
+
+    deinit {
+        free(bytes.baseAddress)
     }
-    return held
+
+    /// The first `count` bytes. Where more are needed than are held, fresh
+    /// memory is taken: what was held is not needed then. It is taken cleared
+    /// from the system, which clears memory it has not handed out before as
+    /// it is first written, by the thread that writes it: clearing it all here,
+    /// on one thread, would hold up every thread that reads into it.
+    func room(_ count: Int) throws -> UnsafeMutableRawBufferPointer {
+        if bytes.count < count {
+            free(bytes.baseAddress)
+            bytes = UnsafeMutableRawBufferPointer(start: nil, count: 0)
+            guard let fresh = calloc(count, 1) else {
+                throw ScionicError.allocationFailed(resource: "chunks read ahead", requested: UInt64(count))
+            }
+            bytes = UnsafeMutableRawBufferPointer(start: fresh, count: count)
+        }
+        return UnsafeMutableRawBufferPointer(rebasing: bytes[..<count])
+    }
 }
 
 /// Reads chunks from a store ahead of what is done with them, several at once.
-/// The buffers serve one batch after another: memory that is used again costs
-/// much less than fresh memory.
+/// The chunks of a batch are read one after another into one stretch of memory,
+/// each into as many bytes as its list gives it, and that memory serves one
+/// batch after another: memory that is used again costs much less than fresh
+/// memory. It is no longer than the longest batch, whatever the lengths of the
+/// chunks of the batches before.
 final class ChunksAhead {
-    private var buffers: [ChunkBuffer] = []
+    private let memory = AheadMemory()
     private let threads: Int
 
     /// Reads with up to `threads` threads at once; zero is one for each core.
     init(threads: Int = 0) {
         self.threads = threads == 0 ? processorCount() : max(threads, 1)
+    }
+
+    /// How many bytes of memory this holds for chunks.
+    var memoryHeld: Int {
+        memory.bytes.count
     }
 
     /// Lends the chunks that `items` name to `body`, each with its place among
@@ -346,45 +444,43 @@ final class ChunksAhead {
                 }
                 return true
             }
-            let read = severalAtOnce(store, batch, .checked, workers)
+            let (read, slots) = try severalAtOnce(store, batch, .checked, workers)
             for (index, item) in batch.enumerated() {
                 guard try read[index].get() else {
                     throw missing("the chunk", item.hash)
                 }
-                try buffers[index].bytes.withUnsafeBytes { try body(first + index, $0) }
+                try body(first + index, UnsafeRawBufferPointer(slots[index]))
             }
             return true
         }
     }
 
     /// Gives `body` the frames of the chunks that `items` name, in their order,
-    /// read from the store as it holds them: whoever takes them checks them.
-    /// Where the chunks are long enough to be worth it, several are read at
-    /// once, ahead of `body`. A chunk that the store does not hold is given as
+    /// lent for the call only and read from the store as it holds them: whoever
+    /// takes them checks them. Where the chunks are long enough to be worth it,
+    /// several are read at once, ahead of `body`. A chunk that the store does
+    /// not hold, or holds with another length than its item gives, is given as
     /// nil, and nothing after it.
-    func frames(_ store: any Store, _ items: ArraySlice<ChunkRef>, to body: ([UInt8]?) throws -> Void) throws {
+    func frames(_ store: any Store, _ items: ArraySlice<ChunkRef>, to body: (UnsafeRawBufferPointer?) throws -> Void) throws {
         try inBatches(items) { _, batch, workers in
             if workers <= 1 {
-                if buffers.isEmpty {
-                    buffers.append(ChunkBuffer())
-                }
-                let buffer = buffers[0]
                 for item in batch {
-                    guard try readInto(store, item, .framed, &buffer.bytes) else {
+                    let slot = try memory.room(slotLength(item, .framed))
+                    guard try readSlot(store, item, .framed, slot) else {
                         try body(nil)
                         return false
                     }
-                    try body(buffer.bytes)
+                    try body(UnsafeRawBufferPointer(slot))
                 }
                 return true
             }
-            let read = severalAtOnce(store, batch, .framed, workers)
+            let (read, slots) = try severalAtOnce(store, batch, .framed, workers)
             for index in 0..<batch.count {
                 guard try read[index].get() else {
                     try body(nil)
                     return false
                 }
-                try body(buffers[index].bytes)
+                try body(UnsafeRawBufferPointer(slots[index]))
             }
             return true
         }
@@ -414,28 +510,30 @@ final class ChunksAhead {
         }
     }
 
-    /// Reads the chunks of `batch` into the buffers on `workers` threads, and
-    /// says for each whether the store holds it.
+    /// Reads the chunks of `batch` on `workers` threads, each into its own part
+    /// of the memory, and says for each whether the store holds it.
     private func severalAtOnce(
         _ store: any Store,
         _ batch: ArraySlice<ChunkRef>,
         _ ahead: Ahead,
         _ workers: Int
-    ) -> [Result<Bool, any Error>] {
-        while buffers.count < batch.count {
-            buffers.append(ChunkBuffer())
+    ) throws -> (read: [Result<Bool, any Error>], slots: [UnsafeMutableRawBufferPointer]) {
+        let lengths = batch.map { slotLength($0, ahead) }
+        var rest = try memory.room(lengths.reduce(0, +))
+        let slots = lengths.map { length -> UnsafeMutableRawBufferPointer in
+            defer { rest = UnsafeMutableRawBufferPointer(rebasing: rest[length...]) }
+            return UnsafeMutableRawBufferPointer(rebasing: rest[..<length])
         }
-        let shared = Unchecked((buffers: Array(buffers[..<batch.count]), batch: batch, ahead: ahead))
+        let shared = Unchecked((slots: slots, batch: batch, ahead: ahead))
         let dealer = Dealer(count: batch.count)
         let read = Shared([Result<Bool, any Error>?](repeating: nil, count: batch.count))
         onWorkers(workers) { _ in
             while let index = dealer.take() {
                 let item = shared.value.batch[shared.value.batch.startIndex + index]
-                let buffer = shared.value.buffers[index]
-                let result = Result { try readInto(store, item, shared.value.ahead, &buffer.bytes) }
+                let result = Result { try readSlot(store, item, shared.value.ahead, shared.value.slots[index]) }
                 read.with { $0[index] = result }
             }
         }
-        return read.with { $0 }.map { $0 ?? .failure(ScionicError.invariant("a chunk was left unread")) }
+        return (read.with { $0 }.map { $0 ?? .failure(ScionicError.invariant("a chunk was left unread")) }, slots)
     }
 }

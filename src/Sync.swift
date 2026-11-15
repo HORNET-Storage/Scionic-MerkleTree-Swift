@@ -60,7 +60,7 @@ private let otherKind = ScionicError.notWanted(what: "an answer of another kind 
 private let tooMuch = ScionicError.notWanted(what: "more than was asked for")
 
 /// Refuses a frame that is longer than its asker takes.
-private func within(_ limit: Int, _ frame: [UInt8]) throws {
+private func within(_ limit: Int, _ frame: UnsafeRawBufferPointer) throws {
     if frame.count > limit {
         throw ScionicError.limitExceeded(what: "a frame", limit: UInt64(max(limit, 0)), requested: UInt64(frame.count))
     }
@@ -111,26 +111,26 @@ public struct Asked: Hashable, Sendable {
 /// `Responder` in this one. A peer is used by one thread at a time.
 public protocol Peer: AnyObject {
     /// Sends one request, and hands each frame of the answer to `onFrame` in
-    /// the order the frames come. An error from `onFrame` ends the answer, and
-    /// is what `ask` throws.
+    /// the order the frames come, lent for that call only. An error from
+    /// `onFrame` ends the answer, and is what `ask` throws.
     ///
     /// `limit` is the longest frame the asker takes in answer. A frame that is
     /// longer is an error, and a peer on a connection refuses it by its length,
     /// before any of it is read.
-    func ask(_ request: [UInt8], limit: Int, onFrame: ([UInt8]) throws -> Void) throws
+    func ask(_ request: [UInt8], limit: Int, onFrame: (UnsafeRawBufferPointer) throws -> Void) throws
 
     /// Sends several requests, each with its limit, and hands each frame to
-    /// `onFrame` with the place of the request that it answers. Answers come in
-    /// the order of the requests.
+    /// `onFrame` with the place of the request that it answers, lent for that
+    /// call only. Answers come in the order of the requests.
     ///
     /// Unless a peer says otherwise, this asks one at a time. A peer on a
     /// connection sends requests ahead of their answers, and saves the waiting
     /// between them.
-    func askAll(_ requests: [Asked], onFrame: (Int, [UInt8]) throws -> Void) throws
+    func askAll(_ requests: [Asked], onFrame: (Int, UnsafeRawBufferPointer) throws -> Void) throws
 }
 
 extension Peer {
-    public func askAll(_ requests: [Asked], onFrame: (Int, [UInt8]) throws -> Void) throws {
+    public func askAll(_ requests: [Asked], onFrame: (Int, UnsafeRawBufferPointer) throws -> Void) throws {
         for (place, asked) in requests.enumerated() {
             try ask(asked.request, limit: asked.limit) { try onFrame(place, $0) }
         }
@@ -322,81 +322,98 @@ public final class Responder: Peer, @unchecked Sendable {
         try body(ahead)
     }
 
-    /// Answers one request. Each frame of the answer is handed to `onFrame`. A
-    /// request that is malformed is an error. A request for something the store
-    /// does not hold is answered with a refusal.
-    public func answer(_ request: [UInt8], onFrame: ([UInt8]) throws -> Void) throws {
-        let notHeld = refusedFrame(.notHeld)
-        let outOfRange = refusedFrame(.outOfRange)
-        switch try Request(decoding: request) {
-        case let .record(root):
-            try onFrame(try store.get(.record, root.hash) ?? notHeld)
-        case let .folder(folder):
-            try onFrame(try store.get(.folderList, folder).map(folderListFrame) ?? notHeld)
-        case let .file(file):
-            try onFrame(try store.get(.fileList, file).map(fileListFrame) ?? notHeld)
+    /// Answers one request. Each frame of the answer is handed to `onFrame`,
+    /// lent for that call only. A request that is malformed is an error. A
+    /// request for something the store does not hold is answered with a
+    /// refusal.
+    public func answer(_ request: [UInt8], onFrame: (UnsafeRawBufferPointer) throws -> Void) throws {
+        let request = try Request(decoding: request)
+        switch request {
         case let .chunk(chunk):
             try withFrame { frame in
                 let held = try lent(store, .chunk, chunk) { refill(&frame, $0) }
-                try onFrame(held ? frame : notHeld)
+                try (held ? frame : refusedFrame(.notHeld)).withUnsafeBytes(onFrame)
             }
-        case let .folderBranch(folder, start, count):
-            guard let open = try openFolder(folder) else {
-                return try onFrame(notHeld)
-            }
-            let total = open.list.count
-            if total == 0 {
-                return try onFrame(folderBranchFrame(.empty))
-            }
-            if start >= total {
-                return try onFrame(outOfRange)
-            }
-            let end = min(total, start + min(UInt64(count), maxBranchItems))
-            try onFrame(folderBranchFrame(try open.open(start: start, end: end)))
-        case let .folderName(folder, name):
-            guard let open = try openFolder(folder) else {
-                return try onFrame(notHeld)
-            }
-            try onFrame(folderBranchFrame(try open.openName(bytes: name)))
-        case let .fileBranch(file, start, count):
-            guard let open = try openFile(file) else {
-                return try onFrame(notHeld)
-            }
-            let total = open.list.count
-            if start >= total {
-                return try onFrame(outOfRange)
-            }
-            let end = min(total, start + min(UInt64(count), maxBranchItems))
-            try onFrame(fileBranchFrame(try open.open(start: start, end: end)))
-        case let .fileBytes(file, offset, length):
-            guard let open = try openFile(file) else {
-                return try onFrame(notHeld)
-            }
-            let size = open.list.size
-            if offset >= size {
-                return try onFrame(outOfRange)
-            }
-            let (first, after) = try open.chunksFor(offset: offset, length: min(length, size - offset))
-            try onFrame(fileBranchFrame(try open.open(start: first, end: min(after, first + maxBranchItems))))
         case let .chunks(file, start, count):
             guard let list = try fileList(file) else {
-                return try onFrame(notHeld)
+                return try refusedFrame(.notHeld).withUnsafeBytes(onFrame)
             }
             if start >= list.count {
-                return try onFrame(outOfRange)
+                return try refusedFrame(.outOfRange).withUnsafeBytes(onFrame)
             }
             let end = min(list.count, start + min(UInt64(count), maxChunksPerAnswer))
             // The chunks are read ahead, several at once, and sent in their
-            // order. A frame is lent to `onFrame` for the call only: the next
-            // chunk is read into it, or into new memory where `onFrame` kept it.
+            // order, each lent to `onFrame` from where it was read. A chunk
+            // that the store holds with another length than the list gives
+            // cannot be it, and is refused as one that is not held.
+            let notHeld = refusedFrame(.notHeld)
             try withAhead { ahead in
                 try ahead.frames(store, list.items[Int(start)..<Int(end)]) { frame in
-                    try onFrame(frame ?? notHeld)
+                    if let frame {
+                        try onFrame(frame)
+                    } else {
+                        try notHeld.withUnsafeBytes(onFrame)
+                    }
                 }
             }
+        default:
+            try oneFrame(request).withUnsafeBytes(onFrame)
+        }
+    }
+
+    /// The one frame that answers `request`, which asks neither for one chunk
+    /// nor for several.
+    private func oneFrame(_ request: Request) throws -> [UInt8] {
+        let notHeld = refusedFrame(.notHeld)
+        let outOfRange = refusedFrame(.outOfRange)
+        switch request {
+        case let .record(root):
+            return try store.get(.record, root.hash) ?? notHeld
+        case let .folder(folder):
+            return try store.get(.folderList, folder).map(folderListFrame) ?? notHeld
+        case let .file(file):
+            return try store.get(.fileList, file).map(fileListFrame) ?? notHeld
+        case let .folderBranch(folder, start, count):
+            guard let open = try openFolder(folder) else {
+                return notHeld
+            }
+            let total = open.list.count
+            if total == 0 {
+                return folderBranchFrame(.empty)
+            }
+            if start >= total {
+                return outOfRange
+            }
+            let end = min(total, start + min(UInt64(count), maxBranchItems))
+            return folderBranchFrame(try open.open(start: start, end: end))
+        case let .folderName(folder, name):
+            guard let open = try openFolder(folder) else {
+                return notHeld
+            }
+            return folderBranchFrame(try open.openName(bytes: name))
+        case let .fileBranch(file, start, count):
+            guard let open = try openFile(file) else {
+                return notHeld
+            }
+            let total = open.list.count
+            if start >= total {
+                return outOfRange
+            }
+            let end = min(total, start + min(UInt64(count), maxBranchItems))
+            return fileBranchFrame(try open.open(start: start, end: end))
+        case let .fileBytes(file, offset, length):
+            guard let open = try openFile(file) else {
+                return notHeld
+            }
+            let size = open.list.size
+            if offset >= size {
+                return outOfRange
+            }
+            let (first, after) = try open.chunksFor(offset: offset, length: min(length, size - offset))
+            return fileBranchFrame(try open.open(start: first, end: min(after, first + maxBranchItems)))
         case let .have(file):
             guard have, let list = try fileList(file) else {
-                return try onFrame(notHeld)
+                return notHeld
             }
             var map = try HaveMap(count: list.count)
             for (number, item) in list.items.enumerated() {
@@ -404,11 +421,13 @@ public final class Responder: Peer, @unchecked Sendable {
                     try map.set(UInt64(number))
                 }
             }
-            try onFrame(haveFrame(map))
+            return haveFrame(map)
+        case .chunk, .chunks:
+            throw ScionicError.invariant("a request for chunks was answered as one frame")
         }
     }
 
-    public func ask(_ request: [UInt8], limit: Int, onFrame: ([UInt8]) throws -> Void) throws {
+    public func ask(_ request: [UInt8], limit: Int, onFrame: (UnsafeRawBufferPointer) throws -> Void) throws {
         try answer(request) { frame in
             try within(limit, frame)
             try onFrame(frame)
@@ -430,7 +449,7 @@ private func askOne(_ peer: any Peer, _ request: Request, limit: Int) throws -> 
         if answer != nil {
             throw tooMuch
         }
-        answer = frame
+        answer = Array(frame)
     }
     guard let frame = answer else {
         throw peerError("gave no answer")
@@ -483,7 +502,7 @@ public func fetch(_ store: any Store, _ root: Root, from peer: any Peer) throws 
                     throw peerError("sent more after it refused")
                 }
                 if frame.first == FrameTag.refused {
-                    _ = try Frame(decoding: frame)
+                    _ = try Frame(decoding: Array(frame))
                     refused[place] = true
                     return
                 }
@@ -495,7 +514,7 @@ public func fetch(_ store: any Store, _ root: Root, from peer: any Peer) throws 
                     try taking.holdCopy(frame, wanted)
                 } else {
                     // What came before is taken in first.
-                    _ = try taking.settled().accept(frame, expected: wanted)
+                    _ = try taking.settled().accept(Array(frame), expected: wanted)
                 }
                 taken[place] += 1
             }
@@ -642,29 +661,35 @@ public final class Remote {
                 if refused {
                     throw peerError("sent more after it refused")
                 }
-                switch try Frame(decoding: frame) {
-                case .refused:
+                // A chunk's frame is checked where it lies; any other frame is
+                // read whole.
+                guard frame.first == FrameTag.chunk else {
+                    guard case .refused = try Frame(decoding: Array(frame)) else {
+                        throw otherKind
+                    }
                     refused = true
-                case let .chunk(bytes):
-                    guard taken < items.count else {
-                        throw tooMuch
-                    }
-                    let item = items[taken]
-                    try checkChunk(item, bytes, "a chunk")
-                    let chunkEnd = chunkStart + UInt64(item.length)
-                    let from = bytes.startIndex + Int(at - chunkStart)
-                    let to = bytes.startIndex + Int(min(end, chunkEnd) - chunkStart)
-                    do {
-                        try bytes[from..<to].withUnsafeBytes { try sink.write($0) }
-                    } catch {
-                        throw streamFailure(error, "write a file's bytes")
-                    }
-                    at = min(end, chunkEnd)
-                    chunkStart = chunkEnd
-                    taken += 1
-                default:
-                    throw otherKind
+                    return
                 }
+                let bytes = UnsafeRawBufferPointer(rebasing: frame[1...])
+                guard !bytes.isEmpty, bytes.count <= Scionic.maxChunkBytes else {
+                    throw invalid("a chunk does not hold 1 byte to 8 MiB")
+                }
+                guard taken < items.count else {
+                    throw tooMuch
+                }
+                let item = items[taken]
+                try checkChunk(item, bytes, "a chunk")
+                let chunkEnd = chunkStart + UInt64(item.length)
+                let from = Int(at - chunkStart)
+                let to = Int(min(end, chunkEnd) - chunkStart)
+                do {
+                    try sink.write(UnsafeRawBufferPointer(rebasing: bytes[from..<to]))
+                } catch {
+                    throw streamFailure(error, "write a file's bytes")
+                }
+                at = min(end, chunkEnd)
+                chunkStart = chunkEnd
+                taken += 1
             }
             if taken == 0 {
                 throw peerError("does not hold the chunks asked for")
@@ -754,8 +779,8 @@ public func importBundle(_ store: any Store, _ root: Root, from source: any Byte
     let intake = try Intake(store: store, root: root)
     // Chunks that come one after another are held, and taken in together by
     // several threads while the next ones are read, once the record is in.
-    // Each frame is read into a buffer of theirs, and one more buffer serves
-    // every other frame of the bundle.
+    // Each frame is read after the chunk frames that are held, and one more
+    // buffer takes every other frame of the bundle.
     let taking = TakingIn(intake)
     var frame: [UInt8] = []
     // What the intake takes changes only when it takes a frame that is not a
@@ -764,13 +789,13 @@ public func importBundle(_ store: any Store, _ root: Root, from source: any Byte
     var recorded = intake.record != nil
     let read = Result<Void, any Error> {
         reading: while true {
-            switch try taking.withNextBuffer({ try readNext(source, limit: limit, into: &$0) }) {
+            switch try taking.readNext(source, limit: limit) {
             case .frame where recorded && taking.nextIsChunk:
                 try taking.hold(nil)
             case .frame:
-                // The frame is moved out of the buffers first, and what came
-                // before it is taken in before it.
-                taking.withNextBuffer { swap(&frame, &$0) }
+                // The frame is taken out first, and what came before it is taken
+                // in before it.
+                taking.takeNext(&frame)
                 let intake = try taking.settled()
                 _ = try intake.accept(frame)
                 limit = intake.frameLimit
@@ -902,7 +927,7 @@ public final class StreamPeer: Peer {
         self.ahead = min(max(ahead, 0), Scionic.requestsAheadBytes)
     }
 
-    public func ask(_ request: [UInt8], limit: Int, onFrame: ([UInt8]) throws -> Void) throws {
+    public func ask(_ request: [UInt8], limit: Int, onFrame: (UnsafeRawBufferPointer) throws -> Void) throws {
         try askAll([Asked(request: request, limit: limit)]) { _, frame in
             try onFrame(frame)
         }
@@ -912,7 +937,7 @@ public final class StreamPeer: Peer {
     /// reads the answers in the order of the requests. A request that no
     /// answerer takes, because it is empty or longer than a request may be, is
     /// an error before anything is sent.
-    public func askAll(_ requests: [Asked], onFrame: (Int, [UInt8]) throws -> Void) throws {
+    public func askAll(_ requests: [Asked], onFrame: (Int, UnsafeRawBufferPointer) throws -> Void) throws {
         if broken {
             throw peerError("is on a connection that an earlier answer left half read")
         }
@@ -956,7 +981,7 @@ public final class StreamPeer: Peer {
                 reading: while true {
                     switch try readNext(input, limit: requests[place].limit, into: &frame) {
                     case .frame:
-                        try onFrame(place, frame)
+                        try frame.withUnsafeBytes { try onFrame(place, $0) }
                     case .end:
                         break reading
                     case .closed:

@@ -122,6 +122,19 @@ final class FolderStore: Store, @unchecked Sendable {
         return true
     }
 
+    /// The library reads chunks that it sends, or reads several at once,
+    /// through here, straight into memory of its own. A file of another
+    /// length than that memory is not read.
+    func readInto(_ kind: Stored, _ hash: Hash, _ into: UnsafeMutableRawBufferPointer) throws -> UInt64? {
+        guard let file = try FileToRead(place(kind, hash).file) else {
+            return nil
+        }
+        if file.length == into.count {
+            try file.readAll(into: into)
+        }
+        return UInt64(file.length)
+    }
+
     /// How many bytes are kept under hash, without reading them. A store need
     /// not have this: the library asks it when it is there, and reads the
     /// whole thing when it is not.

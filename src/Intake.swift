@@ -692,7 +692,7 @@ public final class Intake {
     /// error is that of the first frame, in their order, that is refused or
     /// cannot be kept. A frame after it may have been kept, as it would have
     /// been had it come first.
-    func acceptChunks(_ frames: ArraySlice<[UInt8]>, _ expected: [Arrived?], workers: Int) throws {
+    func acceptChunks(_ frames: [ArraySlice<UInt8>], _ expected: [Arrived?], workers: Int) throws {
         if failed {
             throw ScionicError.intakeFailed
         }
@@ -711,8 +711,8 @@ public final class Intake {
             onWorkers(workerCount(max(workers, 1), work: frames.count)) { _ in
                 // Every frame is taken, whatever became of the one before it.
                 while let index = dealer.take() {
-                    let frame = lent.value.frames[lent.value.frames.startIndex + index]
-                    let result = Result { try takeChunk(store, slots, frame[...], lent.value.expected[index]) }
+                    let frame = lent.value.frames[index]
+                    let result = Result { try takeChunk(store, slots, frame, lent.value.expected[index]) }
                     taken.with { $0[index] = result }
                 }
             }
@@ -943,68 +943,107 @@ private let chunkFramesCount = 1024
 private let chunkBytesByEach = 1 << 20
 
 /// Chunk frames that come one after another, held to be taken in together, so
-/// that several threads hash and keep them at once. The buffers serve one batch
-/// after another: memory that is used again costs much less than fresh memory,
-/// which a system has to find and clear first.
+/// that several threads hash and keep them at once. They are held one after
+/// another in one stretch of memory, which serves one batch after another:
+/// memory that is used again costs much less than fresh memory, which a system
+/// has to find and clear first. It holds room for one batch and the frame that
+/// ends it, and no more, whatever the lengths of the frames of the batches
+/// before.
 final class ChunkFrames {
-    private var buffers: [[UInt8]] = []
+    /// The frames that are held, and after them the frame that was read last,
+    /// until it is held or taken out.
+    private var memory: [UInt8] = []
+    /// Where each frame that is held ends in `memory`.
+    private var ends: [Int] = []
     private var expected: [Arrived?] = []
-    private var held = 0
-    private var bytes = 0
     private let cores = processorCount()
 
-    /// Lends `body` the buffer that the next frame is read into. The frame is
-    /// held only once `hold` is called.
-    func withNextBuffer<T>(_ body: (inout [UInt8]) throws -> T) rethrows -> T {
-        if held == buffers.count {
-            buffers.append([])
+    /// How many bytes the frames that are held take.
+    private var heldBytes: Int {
+        ends.last ?? 0
+    }
+
+    /// How many frames are held.
+    var count: Int {
+        ends.count
+    }
+
+    /// How many bytes of memory this holds for frames.
+    var memoryHeld: Int {
+        memory.capacity
+    }
+
+    /// The room that a batch is held in: the most bytes of a batch, and the
+    /// frame that ends it.
+    static let room = chunkFramesBytes + Scionic.maxChunkBytes + 1
+
+    /// Takes room for a whole batch and the frame that ends it, once: memory
+    /// that grew a step at a time would be moved, and fresh memory taken, at
+    /// every step. Room that is not used is not touched.
+    private func makeRoom() {
+        if memory.capacity < Self.room {
+            memory.reserveCapacity(Self.room)
         }
-        return try body(&buffers[held])
     }
 
-    /// Whether the frame in the next buffer is a chunk's.
+    /// Reads what comes next on `source`, as `readNext` does: a frame is read
+    /// after the frames that are held, and is held only once `hold` is called.
+    func readNext(_ source: any ByteSource, limit: Int) throws -> Next {
+        makeRoom()
+        memory.removeSubrange(heldBytes...)
+        return try readNextOnto(source, limit: limit, frames: &memory)
+    }
+
+    /// Whether the frame that was read last is a chunk's.
     var nextIsChunk: Bool {
-        held < buffers.count && buffers[held].first == FrameTag.chunk
+        heldBytes < memory.count && memory[heldBytes] == FrameTag.chunk
     }
 
-    /// Holds the frame in the next buffer. It has to be `expected`, when that
+    /// Moves the frame that was read last into `frame`, which is emptied first.
+    func takeNext(_ frame: inout [UInt8]) {
+        frame.removeAll(keepingCapacity: true)
+        frame.append(contentsOf: memory[heldBytes...])
+        memory.removeSubrange(heldBytes...)
+    }
+
+    /// Holds the frame that was read last. It has to be `expected`, when that
     /// is given.
     func hold(_ expected: Arrived?) {
-        if held == buffers.count {
-            buffers.append([])
-        }
-        bytes += buffers[held].count
+        ends.append(memory.count)
         self.expected.append(expected)
-        held += 1
     }
 
     /// Holds a copy of `frame`, which is lent for the call only.
-    func holdCopy(_ frame: [UInt8], _ expected: Arrived?) {
-        withNextBuffer { buffer in
-            buffer.removeAll(keepingCapacity: true)
-            buffer.append(contentsOf: frame)
-        }
+    func holdCopy(_ frame: UnsafeRawBufferPointer, _ expected: Arrived?) {
+        makeRoom()
+        memory.removeSubrange(heldBytes...)
+        memory.append(contentsOf: frame)
         hold(expected)
     }
 
     /// Whether enough frames are held to take them in now.
     var full: Bool {
-        bytes >= chunkFramesBytes || held >= chunkFramesCount
+        heldBytes >= chunkFramesBytes || ends.count >= chunkFramesCount
     }
 
     /// Takes the frames that are held into `intake`, and holds none after. With
     /// none held, the intake is not asked anything: an intake that failed has
     /// given its failure already.
     func takeIn(_ intake: Intake) throws {
-        if held == 0 {
+        if ends.isEmpty {
             return
         }
         defer {
-            held = 0
-            bytes = 0
+            memory.removeAll(keepingCapacity: true)
+            ends.removeAll(keepingCapacity: true)
             expected.removeAll(keepingCapacity: true)
         }
-        try intake.acceptChunks(buffers[..<held], expected, workers: min(cores, bytes / chunkBytesByEach + 1))
+        var start = 0
+        let frames = ends.map { end -> ArraySlice<UInt8> in
+            defer { start = end }
+            return memory[start..<end]
+        }
+        try intake.acceptChunks(frames, expected, workers: min(cores, heldBytes / chunkBytesByEach + 1))
     }
 }
 
@@ -1042,25 +1081,30 @@ final class TakingIn {
         self.intake = intake
     }
 
-    /// Lends `body` the buffer that the next frame is read into, as
-    /// `ChunkFrames.withNextBuffer` does.
-    func withNextBuffer<T>(_ body: (inout [UInt8]) throws -> T) rethrows -> T {
-        try held.withNextBuffer(body)
+    /// Reads what comes next on `source`, as `ChunkFrames.readNext` does.
+    func readNext(_ source: any ByteSource, limit: Int) throws -> Next {
+        try held.readNext(source, limit: limit)
     }
 
-    /// Whether the frame in the next buffer is a chunk's.
+    /// Moves the frame that was read last into `frame`, as
+    /// `ChunkFrames.takeNext` does.
+    func takeNext(_ frame: inout [UInt8]) {
+        held.takeNext(&frame)
+    }
+
+    /// Whether the frame that was read last is a chunk's.
     var nextIsChunk: Bool {
         held.nextIsChunk
     }
 
-    /// Holds the frame in the next buffer, as `ChunkFrames.hold` does.
+    /// Holds the frame that was read last, as `ChunkFrames.hold` does.
     func hold(_ expected: Arrived?) throws {
         held.hold(expected)
         try handOverWhenFull()
     }
 
     /// Holds a copy of `frame`, which is lent for the call only.
-    func holdCopy(_ frame: [UInt8], _ expected: Arrived?) throws {
+    func holdCopy(_ frame: UnsafeRawBufferPointer, _ expected: Arrived?) throws {
         held.holdCopy(frame, expected)
         try handOverWhenFull()
     }
