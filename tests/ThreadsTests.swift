@@ -127,6 +127,22 @@ private func chunkPlaces(_ frames: [[UInt8]]) -> [Int] {
     frames.indices.filter { frames[$0].first == FrameTag.chunk }
 }
 
+/// A store that holds what `source` holds, with the chunk `hash` damaged: its
+/// first byte changed.
+private func damagedCopy(_ source: MemoryStore, _ hash: Hash) throws -> MemoryStore {
+    let store = MemoryStore()
+    for kind in Stored.allCases {
+        for held in source.hashes(kind) {
+            var bytes = try XCTUnwrap(source.get(kind, held))
+            if kind == .chunk && held == hash {
+                bytes[0] ^= 1
+            }
+            try store.put(kind, held, bytes)
+        }
+    }
+    return store
+}
+
 final class ThreadsTests: XCTestCase {
     func testOneFileIsTheSameWhateverNumberOfThreadsKeepItsChunks() throws {
         // 6,250 chunks of 16 bytes: more than a builder hands on at a time.
@@ -379,5 +395,29 @@ final class ThreadsTests: XCTestCase {
         let bundle = bundleOf(frames)
         assertFell(endsWithin("an import") { try importBundle(FallingOnPut(), root, from: BytesSource(bundle)) }, "an import")
         assertFell(endsWithin("a fetch") { try fetch(FallingOnPut(), root, from: TestPeer(source)) }, "a fetch")
+    }
+
+    func testABundleEndsAtTheFirstChunkThatIsDamagedOrMissing() throws {
+        let (source, root, frames) = try longTree("threads-export")
+        let places = chunkPlaces(frames)
+        // A bundle holds a file's chunks in the order of the file's list.
+        let items = try fileOf(source, recordOf(source, root).top).items
+        XCTAssertEqual(places.map { Hash.of(frames[$0].dropFirst()) }, items.map(\.hash))
+        // The chunks are read and checked ahead, several at once, and written in
+        // order: what comes out is the bundle up to the bad chunk.
+        for bad in [places[0], places[2], places[places.count - 1]] {
+            let hash = Hash.of(frames[bad].dropFirst())
+            let before = bundleOf(Array(frames[..<bad]))
+
+            let damaged = try damagedCopy(source, hash)
+            var out = MemorySink()
+            assertFails(try exportBundle(damaged, root, to: out), "corrupt", "damaged chunk at frame \(bad)")
+            XCTAssertTrue(out.bytes == before, "damaged chunk at frame \(bad)")
+
+            try damaged.remove(.chunk, hash)
+            out = MemorySink()
+            assertFails(try exportBundle(damaged, root, to: out), "missing", "missing chunk at frame \(bad)")
+            XCTAssertTrue(out.bytes == before, "missing chunk at frame \(bad)")
+        }
     }
 }

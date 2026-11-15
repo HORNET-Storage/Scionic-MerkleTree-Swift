@@ -681,6 +681,9 @@ public func exportBundle(_ store: any Store, _ root: Root, to sink: any ByteSink
     var files = Set<Hash>()
     var folders = Set<Hash>()
     var chunks = Set<Hash>()
+    // A file's chunks are read and checked ahead, several at once, and written
+    // in their order.
+    let ahead = ChunksAhead()
     var pending = [record.top]
     while let target = pending.popLast() {
         switch target.kind {
@@ -697,16 +700,9 @@ public func exportBundle(_ store: any Store, _ root: Root, to sink: any ByteSink
             }
             let list = try fileOf(store, target)
             try writeFrame(sink, tag: FrameTag.fileList, body: list.encode())
-            for item in list.items {
-                if !chunks.insert(item.hash).inserted {
-                    continue
-                }
-                let held = try lendChunk(store, item) { bytes in
-                    try writeFrame(sink, tag: FrameTag.chunk, body: bytes)
-                }
-                guard held else {
-                    throw missing("the chunk", item.hash)
-                }
+            let new = list.items.filter { chunks.insert($0.hash).inserted }
+            try ahead.lend(store, new[...]) { _, bytes in
+                try writeFrame(sink, tag: FrameTag.chunk, body: bytes)
             }
         }
     }

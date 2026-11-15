@@ -264,12 +264,128 @@ func lent(_ store: any Store, _ kind: Stored, _ hash: Hash, to body: (UnsafeRawB
 /// says, show that the item is wrong.
 func lendChunk(_ store: any Store, _ item: ChunkRef, to body: (UnsafeRawBufferPointer) throws -> Void) throws -> Bool {
     try lent(store, .chunk, item.hash) { bytes in
-        guard Hash.of(bytes) == item.hash else {
-            throw damaged("a stored chunk", item.hash)
-        }
-        guard bytes.count == Int(item.length) else {
-            throw ScionicError.sizeMismatch(what: "a stored chunk", expected: UInt64(item.length), actual: UInt64(bytes.count))
-        }
+        try checkStoredChunk(item, bytes)
         try body(bytes)
+    }
+}
+
+/// Holds bytes read from a store to the chunk that `item` names. Bytes that do
+/// not hash to the chunk's hash are damaged. Bytes that do, and are not as many
+/// as the item says, show that the item is wrong.
+private func checkStoredChunk(_ item: ChunkRef, _ bytes: UnsafeRawBufferPointer) throws {
+    guard Hash.of(bytes) == item.hash else {
+        throw damaged("a stored chunk", item.hash)
+    }
+    guard bytes.count == Int(item.length) else {
+        throw ScionicError.sizeMismatch(what: "a stored chunk", expected: UInt64(item.length), actual: UInt64(bytes.count))
+    }
+}
+
+/// The most bytes of chunks that are read ahead of what is done with them.
+private let aheadBytes: UInt64 = 64 << 20
+
+/// The most chunks that are read ahead, however short.
+private let aheadCount = 1024
+
+/// The least bytes of chunks that are worth a thread of their own.
+private let aheadBytesByEach: UInt64 = 1 << 20
+
+/// Memory that a chunk is read into, by one thread at a time.
+private final class ChunkBuffer: @unchecked Sendable {
+    var bytes: [UInt8] = []
+}
+
+/// Reads the chunk that `item` names into `buffer`, from its start, and checks
+/// it as `lendChunk` does. Says whether the store holds it.
+private func readInto(_ store: any Store, _ item: ChunkRef, _ buffer: inout [UInt8]) throws -> Bool {
+    buffer.removeAll(keepingCapacity: true)
+    let held = try lent(store, .chunk, item.hash) { buffer.append(contentsOf: $0) }
+    if held {
+        try buffer.withUnsafeBytes { try checkStoredChunk(item, $0) }
+    }
+    return held
+}
+
+/// Reads chunks from a store ahead of what is done with them, several at once.
+/// The buffers serve one batch after another: memory that is used again costs
+/// much less than fresh memory.
+final class ChunksAhead {
+    private var buffers: [ChunkBuffer] = []
+    private let threads: Int
+
+    /// Reads with up to `threads` threads at once; zero is one for each core.
+    init(threads: Int = 0) {
+        self.threads = threads == 0 ? processorCount() : max(threads, 1)
+    }
+
+    /// Lends the chunks that `items` name to `body`, each with its place among
+    /// them, in their order. Each is read from the store and checked first, as
+    /// `lendChunk` checks it. Where the chunks are long enough to be worth it,
+    /// several are read and checked at once, ahead of `body`; otherwise each is
+    /// lent straight from the store. The first chunk that is missing or damaged
+    /// is the error, and `body` is given neither it nor any after it.
+    func lend(_ store: any Store, _ items: ArraySlice<ChunkRef>, to body: (Int, UnsafeRawBufferPointer) throws -> Void) throws {
+        try inBatches(items) { first, batch, workers in
+            if workers <= 1 {
+                for (index, item) in batch.enumerated() {
+                    guard try lendChunk(store, item, to: { try body(first + index, $0) }) else {
+                        throw missing("the chunk", item.hash)
+                    }
+                }
+                return true
+            }
+            let read = severalAtOnce(store, batch, workers)
+            for (index, item) in batch.enumerated() {
+                guard try read[index].get() else {
+                    throw missing("the chunk", item.hash)
+                }
+                try buffers[index].bytes.withUnsafeBytes { try body(first + index, $0) }
+            }
+            return true
+        }
+    }
+
+    /// Hands `body` each batch of `items` that is read ahead at once: the place
+    /// of its first item among them, its items, and how many threads read them.
+    /// A batch holds up to 64 MiB of chunks, and up to 1024 of them. It stops
+    /// where `body` says so.
+    private func inBatches(_ items: ArraySlice<ChunkRef>, _ body: (Int, ArraySlice<ChunkRef>, Int) throws -> Bool) rethrows {
+        var first = items.startIndex
+        while first < items.endIndex {
+            var count = 0
+            var bytes: UInt64 = 0
+            for item in items[first...].prefix(aheadCount) {
+                if count > 0 && bytes + UInt64(item.length) > aheadBytes {
+                    break
+                }
+                bytes += UInt64(item.length)
+                count += 1
+            }
+            let workers = min(threads, Int(bytes / aheadBytesByEach) + 1, count)
+            guard try body(first - items.startIndex, items[first..<(first + count)], workers) else {
+                return
+            }
+            first += count
+        }
+    }
+
+    /// Reads the chunks of `batch` into the buffers on `workers` threads, and
+    /// says for each whether the store holds it.
+    private func severalAtOnce(_ store: any Store, _ batch: ArraySlice<ChunkRef>, _ workers: Int) -> [Result<Bool, any Error>] {
+        while buffers.count < batch.count {
+            buffers.append(ChunkBuffer())
+        }
+        let shared = Unchecked((buffers: Array(buffers[..<batch.count]), batch: batch))
+        let dealer = Dealer(count: batch.count)
+        let read = Shared([Result<Bool, any Error>?](repeating: nil, count: batch.count))
+        onWorkers(workers) { _ in
+            while let index = dealer.take() {
+                let item = shared.value.batch[shared.value.batch.startIndex + index]
+                let buffer = shared.value.buffers[index]
+                let result = Result { try readInto(store, item, &buffer.bytes) }
+                read.with { $0[index] = result }
+            }
+        }
+        return read.with { $0 }.map { $0 ?? .failure(ScionicError.invariant("a chunk was left unread")) }
     }
 }
