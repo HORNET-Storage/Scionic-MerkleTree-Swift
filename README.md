@@ -549,7 +549,7 @@ The files under `spec/` are the Rust library's, copied byte for byte. The tests 
 | --- | --- | --- |
 | Swift, this repository | 2.5.6 | |
 | [Rust](https://github.com/HORNET-Storage/Scionic-MerkleTree-Rust) | 2.5.6 | The reference for the format. |
-| [Go](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) | 2.5.6 | |
+| [Go](https://github.com/HORNET-Storage/Scionic-MerkleTree-Go) | 2.5.6 | |
 
 The three libraries are kept in step: one format, one set of vectors and one version number. A tree built by the Rust or the Go library and one built by this library from the same folder have the same root, and each reads what the others write.
 
