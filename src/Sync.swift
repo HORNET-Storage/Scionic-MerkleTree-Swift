@@ -280,7 +280,9 @@ public final class Responder: Peer, @unchecked Sendable {
         case let .file(file):
             try onFrame(try store.get(.fileList, file).map(fileListFrame) ?? notHeld)
         case let .chunk(chunk):
-            try onFrame(try store.get(.chunk, chunk).map { chunkFrame($0) } ?? notHeld)
+            var frame: [UInt8] = []
+            let held = try lent(store, .chunk, chunk) { frame = chunkFrame($0) }
+            try onFrame(held ? frame : notHeld)
         case let .folderBranch(folder, start, count):
             guard let open = try openFolder(folder) else {
                 return try onFrame(notHeld)
@@ -333,12 +335,14 @@ public final class Responder: Peer, @unchecked Sendable {
             // is copied before it is filled again.
             var frame: [UInt8] = []
             for item in list.items[Int(start)..<Int(end)] {
-                guard let bytes = try store.get(.chunk, item.hash) else {
+                let held = try lent(store, .chunk, item.hash) { bytes in
+                    frame.removeAll(keepingCapacity: true)
+                    frame.append(FrameTag.chunk)
+                    frame.append(contentsOf: bytes)
+                }
+                guard held else {
                     return try onFrame(notHeld)
                 }
-                frame.removeAll(keepingCapacity: true)
-                frame.append(FrameTag.chunk)
-                frame.append(contentsOf: bytes)
                 try onFrame(frame)
             }
         case let .have(file):
@@ -651,10 +655,12 @@ public func exportBundle(_ store: any Store, _ root: Root, to sink: any ByteSink
                 if !chunks.insert(item.hash).inserted {
                     continue
                 }
-                guard let bytes = try loadChunk(store, item) else {
+                let held = try lendChunk(store, item) { bytes in
+                    try writeFrame(sink, tag: FrameTag.chunk, body: bytes)
+                }
+                guard held else {
                     throw missing("the chunk", item.hash)
                 }
-                try writeFrame(sink, tag: FrameTag.chunk, body: bytes)
             }
         }
     }

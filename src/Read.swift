@@ -189,15 +189,17 @@ private func writeStretch(
         }
     }
     for (item, start) in wanted {
-        guard let bytes = try loadChunk(store, item) else {
-            throw missing("the chunk", item.hash)
-        }
         let from = Int(offset > start ? offset - start : 0)
         let to = Int(min(end, start + UInt64(item.length)) - start)
-        do {
-            try bytes.withUnsafeBytes { try sink.write(UnsafeRawBufferPointer(rebasing: $0[from..<to])) }
-        } catch {
-            throw streamFailure(error, "write a file's bytes")
+        let held = try lendChunk(store, item) { bytes in
+            do {
+                try sink.write(UnsafeRawBufferPointer(rebasing: bytes[from..<to]))
+            } catch {
+                throw streamFailure(error, "write a file's bytes")
+            }
+        }
+        guard held else {
+            throw missing("the chunk", item.hash)
         }
     }
 }

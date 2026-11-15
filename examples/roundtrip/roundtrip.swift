@@ -37,6 +37,11 @@ final class FolderStore: Store, @unchecked Sendable {
     /// and the second would put it in the place of a file that someone may be
     /// reading, which Windows does not allow.
     private let writing = (0..<1024).map { _ in NSLock() }
+    /// Memory that things are read into, kept for the next read: fresh memory
+    /// for each chunk, as `get` takes, costs some systems more than the reading
+    /// does. One for each thread that reads at once, under `spare`.
+    private var buffers: [[UInt8]] = []
+    private let spare = NSLock()
 
     init(_ folder: String) {
         #if os(Windows)
@@ -69,7 +74,11 @@ final class FolderStore: Store, @unchecked Sendable {
         if exists(place.file) {
             return
         }
-        try makeFolders(place.folder)
+        // Looked at first: trying to make a folder that is there already costs
+        // several times what seeing that it is there does.
+        if !exists(place.folder) {
+            try makeFolders(place.folder)
+        }
         // Written under another name first, so that a file is never found under
         // a hash before all of its bytes are there. The bytes are written from
         // where they are, without a copy.
@@ -92,6 +101,25 @@ final class FolderStore: Store, @unchecked Sendable {
     /// What is kept under hash, if anything.
     func get(_ kind: Stored, _ hash: Hash) throws -> [UInt8]? {
         try readWhole(place(kind, hash).file)
+    }
+
+    /// Lends what is kept under hash, read into memory that was read into
+    /// before. The library reads a tree's chunks this way.
+    func lend(_ kind: Stored, _ hash: Hash, to body: (UnsafeRawBufferPointer) throws -> Void) throws -> Bool {
+        guard let file = try FileToRead(place(kind, hash).file) else {
+            return false
+        }
+        var buffer = spare.withLock { buffers.popLast() } ?? []
+        defer { spare.withLock { buffers.append(buffer) } }
+        if buffer.count < file.length {
+            buffer = [UInt8](repeating: 0, count: file.length)
+        }
+        try buffer.withUnsafeMutableBytes { raw in
+            let room = UnsafeMutableRawBufferPointer(rebasing: raw[0..<file.length])
+            try file.readAll(into: room)
+            try body(UnsafeRawBufferPointer(room))
+        }
+        return true
     }
 
     /// How many bytes are kept under hash, without reading them. A store need
@@ -156,32 +184,48 @@ func longForm(_ path: String) -> String {
     return "\\\\?\\" + full
 }
 
-/// The whole of the file at `path`, or nil if there is none.
-func readWhole(_ path: String) throws -> [UInt8]? {
-    let handle = CreateFileW(wide(path), genericRead, shareReadAndDelete, nil, openExisting, sequentialScan, nil)
-    if isInvalid(handle) {
-        let code = GetLastError()
-        if code == noSuchFile || code == noSuchPath {
-            return nil
+/// A file that is open to be read, and is closed when it is let go of.
+final class FileToRead {
+    let path: String
+    /// How many bytes the file holds.
+    let length: Int
+    private let handle: HANDLE?
+
+    /// The file at `path`, or nil if there is none.
+    init?(_ path: String) throws {
+        let handle = CreateFileW(wide(path), genericRead, shareReadAndDelete, nil, openExisting, sequentialScan, nil)
+        if isInvalid(handle) {
+            let code = GetLastError()
+            if code == noSuchFile || code == noSuchPath {
+                return nil
+            }
+            throw DiskError(what: "open", path: path, code: Int(code))
         }
-        throw DiskError(what: "open", path: path, code: Int(code))
+        var length = LARGE_INTEGER()
+        guard GetFileSizeEx(handle, &length) else {
+            let code = GetLastError()
+            CloseHandle(handle)
+            throw DiskError(what: "look at", path: path, code: Int(code))
+        }
+        self.path = path
+        self.length = Int(length.QuadPart)
+        self.handle = handle
     }
-    defer { CloseHandle(handle) }
-    var length = LARGE_INTEGER()
-    guard GetFileSizeEx(handle, &length) else {
-        throw DiskError(what: "look at", path: path, code: Int(GetLastError()))
+
+    deinit {
+        CloseHandle(handle)
     }
-    let count = Int(length.QuadPart)
-    return try [UInt8](unsafeUninitializedCapacity: count) { buffer, initialized in
+
+    /// Reads the whole file into `room`, which is as long as the file.
+    func readAll(into room: UnsafeMutableRawBufferPointer) throws {
         var done = 0
-        while done < count {
+        while done < length {
             var read: DWORD = 0
-            guard ReadFile(handle, buffer.baseAddress! + done, DWORD(min(count - done, 1 << 30)), &read, nil), read > 0 else {
+            guard ReadFile(handle, room.baseAddress! + done, DWORD(min(length - done, 1 << 30)), &read, nil), read > 0 else {
                 throw DiskError(what: "read", path: path, code: Int(GetLastError()))
             }
             done += Int(read)
         }
-        initialized = count
     }
 }
 
@@ -250,25 +294,42 @@ func makeFolders(_ path: String) throws {
 #else
 private let separator = "/"
 
-/// The whole of the file at `path`, or nil if there is none.
-func readWhole(_ path: String) throws -> [UInt8]? {
-    let fd = open(path, O_RDONLY | O_CLOEXEC)
-    if fd < 0 {
-        if errno == ENOENT {
-            return nil
+/// A file that is open to be read, and is closed when it is let go of.
+final class FileToRead {
+    let path: String
+    /// How many bytes the file holds.
+    let length: Int
+    private let fd: Int32
+
+    /// The file at `path`, or nil if there is none.
+    init?(_ path: String) throws {
+        let fd = open(path, O_RDONLY | O_CLOEXEC)
+        if fd < 0 {
+            if errno == ENOENT {
+                return nil
+            }
+            throw DiskError(what: "open", path: path, code: Int(errno))
         }
-        throw DiskError(what: "open", path: path, code: Int(errno))
+        var info = stat()
+        guard fstat(fd, &info) == 0 else {
+            let code = errno
+            _ = close(fd)
+            throw DiskError(what: "look at", path: path, code: Int(code))
+        }
+        self.path = path
+        self.length = Int(info.st_size)
+        self.fd = fd
     }
-    defer { _ = close(fd) }
-    var info = stat()
-    guard fstat(fd, &info) == 0 else {
-        throw DiskError(what: "look at", path: path, code: Int(errno))
+
+    deinit {
+        _ = close(fd)
     }
-    let count = Int(info.st_size)
-    return try [UInt8](unsafeUninitializedCapacity: count) { buffer, initialized in
+
+    /// Reads the whole file into `room`, which is as long as the file.
+    func readAll(into room: UnsafeMutableRawBufferPointer) throws {
         var done = 0
-        while done < count {
-            let got = read(fd, buffer.baseAddress! + done, count - done)
+        while done < length {
+            let got = read(fd, room.baseAddress! + done, length - done)
             if got < 0 && errno == EINTR {
                 continue
             }
@@ -277,7 +338,6 @@ func readWhole(_ path: String) throws -> [UInt8]? {
             }
             done += got
         }
-        initialized = count
     }
 }
 
@@ -339,6 +399,17 @@ func makeFolders(_ path: String) throws {
     }
 }
 #endif
+
+/// The whole of the file at `path`, or nil if there is none.
+func readWhole(_ path: String) throws -> [UInt8]? {
+    guard let file = try FileToRead(path) else {
+        return nil
+    }
+    return try [UInt8](unsafeUninitializedCapacity: file.length) { buffer, initialized in
+        try file.readAll(into: UnsafeMutableRawBufferPointer(buffer))
+        initialized = file.length
+    }
+}
 
 /// Gives a file another name in one step, with the system's own call, which
 /// does not wait for the disk as Foundation's `moveItem` does on Windows.

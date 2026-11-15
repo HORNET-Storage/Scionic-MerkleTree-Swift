@@ -488,10 +488,11 @@ public final class Intake {
             while let index = dealer.take() {
                 do {
                     let item = held[index]
-                    guard let bytes = try store.get(.chunk, item.hash) else {
+                    var sound = false
+                    guard try lent(store, .chunk, item.hash, to: { sound = item.matches($0) }) else {
                         throw missing("the chunk", item.hash)
                     }
-                    if !item.matches(bytes) {
+                    if !sound {
                         spoiled.with { $0.append(index) }
                     }
                 } catch {
