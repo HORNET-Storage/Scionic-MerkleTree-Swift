@@ -1,9 +1,9 @@
 // Roundtrip takes a tree its whole way round, with a store on disk.
 //
 // It builds a tree from a folder, checks it, fetches it into a second store
-// as a receiver would, reads a stretch from the middle of its largest file
-// without the rest, writes the tree out again, and holds the copy to the
-// same root. It prints how long each step took.
+// as a receiver would, reads stretches of its largest file without the rest,
+// writes the tree out again, and holds the copy to the same root. It prints
+// how long each step took.
 //
 //     swift run -c release roundtrip <folder> <work-dir>
 //
@@ -15,9 +15,22 @@
 
 import Foundation
 import ScionicMerkleTree
+#if os(Windows)
+import WinSDK
+#elseif canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// A store that keeps each thing as a file named by its hash.
+///
+/// It asks the system for each file itself, as the Go and Rust examples do
+/// through their standard libraries: Foundation's calls for files cost several
+/// times as much on Windows, and a store is asked for every chunk.
 final class FolderStore: Store, @unchecked Sendable {
+    /// Where the files are kept. On Windows it is whole and in the long form,
+    /// `\\?\C:\...`, so that Windows takes a path of any length.
     let folder: String
     /// One writer at a time keeps a thing, by the start of its hash. Two
     /// writers of the same thing would otherwise each put a file in its place,
@@ -26,7 +39,11 @@ final class FolderStore: Store, @unchecked Sendable {
     private let writing = (0..<1024).map { _ in NSLock() }
 
     init(_ folder: String) {
+        #if os(Windows)
+        self.folder = longForm(folder)
+        #else
         self.folder = folder
+        #endif
     }
 
     /// The folder that holds a thing, and the file that it is kept as.
@@ -39,8 +56,8 @@ final class FolderStore: Store, @unchecked Sendable {
         case .record: kept = "records"
         }
         let name = hash.hex
-        let inside = folder + "/" + kept + "/" + String(name.prefix(2))
-        return (inside, inside + "/" + name)
+        let inside = folder + separator + kept + separator + String(name.prefix(2))
+        return (inside, inside + separator + name)
     }
 
     /// Keeps bytes under hash. Keeping what is kept already changes nothing.
@@ -49,78 +66,279 @@ final class FolderStore: Store, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let place = self.place(kind, hash)
-        if FileManager.default.fileExists(atPath: place.file) {
+        if exists(place.file) {
             return
         }
-        try FileManager.default.createDirectory(atPath: place.folder, withIntermediateDirectories: true)
+        try makeFolders(place.folder)
         // Written under another name first, so that a file is never found under
         // a hash before all of its bytes are there. The bytes are written from
         // where they are, without a copy.
         let unfinished = place.file + ".writing-" + UUID().uuidString
-        guard FileManager.default.createFile(atPath: unfinished, contents: nil) else {
-            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: unfinished])
-        }
         do {
-            let file = try FileHandle(forWritingTo: URL(fileURLWithPath: unfinished))
-            do {
-                try file.write(contentsOf: bytes)
-            } catch {
-                try? file.close()
-                throw error
-            }
-            try file.close()
+            try createFile(unfinished, with: bytes)
         } catch {
-            try? FileManager.default.removeItem(atPath: unfinished)
+            try? removeFile(unfinished)
             throw error
         }
         if !rename(unfinished, to: place.file) {
-            try? FileManager.default.removeItem(atPath: unfinished)
+            try? removeFile(unfinished)
             // Another program kept the same thing meanwhile, and that is no error.
-            if !FileManager.default.fileExists(atPath: place.file) {
-                throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: place.file])
+            if !exists(place.file) {
+                throw DiskError(what: "keep", path: place.file, code: nil)
             }
         }
     }
 
     /// What is kept under hash, if anything.
     func get(_ kind: Stored, _ hash: Hash) throws -> [UInt8]? {
-        do {
-            return [UInt8](try Data(contentsOf: URL(fileURLWithPath: place(kind, hash).file)))
-        } catch let error as CocoaError where isMissing(error) {
-            return nil
-        }
+        try readWhole(place(kind, hash).file)
     }
 
     /// How many bytes are kept under hash, without reading them. A store need
     /// not have this: the library asks it when it is there, and reads the
     /// whole thing when it is not.
     func size(_ kind: Stored, _ hash: Hash) throws -> UInt64? {
-        let attributes: [FileAttributeKey: Any]
-        do {
-            attributes = try FileManager.default.attributesOfItem(atPath: place(kind, hash).file)
-        } catch let error as CocoaError where isMissing(error) {
-            return nil
-        }
-        guard let size = attributes[.size] as? NSNumber else {
-            throw CocoaError(.fileReadUnknown)
-        }
-        return size.uint64Value
+        try sizeOf(place(kind, hash).file)
     }
 
     /// Forgets what is kept under hash.
     func remove(_ kind: Stored, _ hash: Hash) throws {
-        do {
-            try FileManager.default.removeItem(atPath: place(kind, hash).file)
-        } catch let error as CocoaError where isMissing(error) {
-            // It was not there, and it is not there now.
+        try removeFile(place(kind, hash).file)
+    }
+}
+
+/// A call to the system that failed.
+struct DiskError: Error, CustomStringConvertible {
+    let what: String
+    let path: String
+    let code: Int?
+
+    var description: String {
+        "could not \(what) \(path)" + (code.map { ": the system gave error \($0)" } ?? "")
+    }
+}
+
+#if os(Windows)
+private let separator = "\\"
+private let genericRead: DWORD = 0x8000_0000
+private let genericWrite: DWORD = 0x4000_0000
+private let shareReadAndDelete: DWORD = 0x1 | 0x4
+private let createNew: DWORD = 1
+private let openExisting: DWORD = 3
+private let attributeNormal: DWORD = 0x80
+private let sequentialScan: DWORD = 0x0800_0000
+private let noSuchFile: DWORD = 2
+private let noSuchPath: DWORD = 3
+private let alreadyThere: DWORD = 183
+private let noAttributes: DWORD = 0xFFFF_FFFF
+
+private func wide(_ path: String) -> [UInt16] {
+    Array(path.utf16) + [0]
+}
+
+private func isInvalid(_ handle: HANDLE?) -> Bool {
+    handle == nil || handle == HANDLE(bitPattern: -1)
+}
+
+/// `path` whole, in the long form that Windows takes as it is written.
+func longForm(_ path: String) -> String {
+    let given = wide(path)
+    let length = GetFullPathNameW(given, 0, nil, nil)
+    var whole = [UInt16](repeating: 0, count: Int(length))
+    let written = GetFullPathNameW(given, length, &whole, nil)
+    let full = String(decoding: whole.prefix(Int(written)), as: UTF16.self)
+    if full.hasPrefix("\\\\?\\") {
+        return full
+    }
+    if full.hasPrefix("\\\\") {
+        return "\\\\?\\UNC\\" + full.dropFirst(2)
+    }
+    return "\\\\?\\" + full
+}
+
+/// The whole of the file at `path`, or nil if there is none.
+func readWhole(_ path: String) throws -> [UInt8]? {
+    let handle = CreateFileW(wide(path), genericRead, shareReadAndDelete, nil, openExisting, sequentialScan, nil)
+    if isInvalid(handle) {
+        let code = GetLastError()
+        if code == noSuchFile || code == noSuchPath {
+            return nil
+        }
+        throw DiskError(what: "open", path: path, code: Int(code))
+    }
+    defer { CloseHandle(handle) }
+    var length = LARGE_INTEGER()
+    guard GetFileSizeEx(handle, &length) else {
+        throw DiskError(what: "look at", path: path, code: Int(GetLastError()))
+    }
+    let count = Int(length.QuadPart)
+    return try [UInt8](unsafeUninitializedCapacity: count) { buffer, initialized in
+        var done = 0
+        while done < count {
+            var read: DWORD = 0
+            guard ReadFile(handle, buffer.baseAddress! + done, DWORD(min(count - done, 1 << 30)), &read, nil), read > 0 else {
+                throw DiskError(what: "read", path: path, code: Int(GetLastError()))
+            }
+            done += Int(read)
+        }
+        initialized = count
+    }
+}
+
+/// A new file at `path` with `bytes` in it. Nothing may be there yet.
+func createFile(_ path: String, with bytes: UnsafeRawBufferPointer) throws {
+    let handle = CreateFileW(wide(path), genericWrite, 0, nil, createNew, attributeNormal, nil)
+    if isInvalid(handle) {
+        throw DiskError(what: "make", path: path, code: Int(GetLastError()))
+    }
+    defer { CloseHandle(handle) }
+    var done = 0
+    while done < bytes.count {
+        var written: DWORD = 0
+        guard WriteFile(handle, bytes.baseAddress! + done, DWORD(min(bytes.count - done, 1 << 30)), &written, nil), written > 0 else {
+            throw DiskError(what: "write", path: path, code: Int(GetLastError()))
+        }
+        done += Int(written)
+    }
+}
+
+/// How long the file at `path` is, or nil if there is none.
+func sizeOf(_ path: String) throws -> UInt64? {
+    var data = WIN32_FILE_ATTRIBUTE_DATA()
+    guard GetFileAttributesExW(wide(path), GetFileExInfoStandard, &data) else {
+        let code = GetLastError()
+        if code == noSuchFile || code == noSuchPath {
+            return nil
+        }
+        throw DiskError(what: "look at", path: path, code: Int(code))
+    }
+    return UInt64(data.nFileSizeHigh) << 32 | UInt64(data.nFileSizeLow)
+}
+
+/// Whether anything is at `path`.
+func exists(_ path: String) -> Bool {
+    GetFileAttributesW(wide(path)) != noAttributes
+}
+
+/// Removes the file at `path`, which need not be there.
+func removeFile(_ path: String) throws {
+    if !DeleteFileW(wide(path)) {
+        let code = GetLastError()
+        if code != noSuchFile && code != noSuchPath {
+            throw DiskError(what: "remove", path: path, code: Int(code))
         }
     }
 }
 
-/// Whether an error says that there was no such file.
-func isMissing(_ error: CocoaError) -> Bool {
-    error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile
+/// Makes the folder at `path`, and the folders above it that are not there.
+func makeFolders(_ path: String) throws {
+    if CreateDirectoryW(wide(path), nil) {
+        return
+    }
+    let code = GetLastError()
+    if code == alreadyThere {
+        return
+    }
+    guard code == noSuchPath, let cut = path.lastIndex(of: "\\"), cut > path.startIndex else {
+        throw DiskError(what: "make the folder", path: path, code: Int(code))
+    }
+    try makeFolders(String(path[..<cut]))
+    if !CreateDirectoryW(wide(path), nil) && GetLastError() != alreadyThere {
+        throw DiskError(what: "make the folder", path: path, code: Int(GetLastError()))
+    }
 }
+#else
+private let separator = "/"
+
+/// The whole of the file at `path`, or nil if there is none.
+func readWhole(_ path: String) throws -> [UInt8]? {
+    let fd = open(path, O_RDONLY | O_CLOEXEC)
+    if fd < 0 {
+        if errno == ENOENT {
+            return nil
+        }
+        throw DiskError(what: "open", path: path, code: Int(errno))
+    }
+    defer { _ = close(fd) }
+    var info = stat()
+    guard fstat(fd, &info) == 0 else {
+        throw DiskError(what: "look at", path: path, code: Int(errno))
+    }
+    let count = Int(info.st_size)
+    return try [UInt8](unsafeUninitializedCapacity: count) { buffer, initialized in
+        var done = 0
+        while done < count {
+            let got = read(fd, buffer.baseAddress! + done, count - done)
+            if got < 0 && errno == EINTR {
+                continue
+            }
+            guard got > 0 else {
+                throw DiskError(what: "read", path: path, code: Int(errno))
+            }
+            done += got
+        }
+        initialized = count
+    }
+}
+
+/// A new file at `path` with `bytes` in it. Nothing may be there yet.
+func createFile(_ path: String, with bytes: UnsafeRawBufferPointer) throws {
+    let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o644)
+    guard fd >= 0 else {
+        throw DiskError(what: "make", path: path, code: Int(errno))
+    }
+    defer { _ = close(fd) }
+    var done = 0
+    while done < bytes.count {
+        let wrote = write(fd, bytes.baseAddress! + done, bytes.count - done)
+        if wrote < 0 && errno == EINTR {
+            continue
+        }
+        guard wrote > 0 else {
+            throw DiskError(what: "write", path: path, code: Int(errno))
+        }
+        done += wrote
+    }
+}
+
+/// How long the file at `path` is, or nil if there is none.
+func sizeOf(_ path: String) throws -> UInt64? {
+    var info = stat()
+    if stat(path, &info) != 0 {
+        if errno == ENOENT {
+            return nil
+        }
+        throw DiskError(what: "look at", path: path, code: Int(errno))
+    }
+    return UInt64(info.st_size)
+}
+
+/// Whether anything is at `path`.
+func exists(_ path: String) -> Bool {
+    access(path, F_OK) == 0
+}
+
+/// Removes the file at `path`, which need not be there.
+func removeFile(_ path: String) throws {
+    if unlink(path) != 0 && errno != ENOENT {
+        throw DiskError(what: "remove", path: path, code: Int(errno))
+    }
+}
+
+/// Makes the folder at `path`, and the folders above it that are not there.
+func makeFolders(_ path: String) throws {
+    if mkdir(path, 0o777) == 0 || errno == EEXIST {
+        return
+    }
+    guard errno == ENOENT, let cut = path.lastIndex(of: "/"), cut > path.startIndex else {
+        throw DiskError(what: "make the folder", path: path, code: Int(errno))
+    }
+    try makeFolders(String(path[..<cut]))
+    if mkdir(path, 0o777) != 0 && errno != EEXIST {
+        throw DiskError(what: "make the folder", path: path, code: Int(errno))
+    }
+}
+#endif
 
 /// Gives a file another name in one step, with the system's own call, which
 /// does not wait for the disk as Foundation's `moveItem` does on Windows.
@@ -198,13 +416,20 @@ func roundtrip<Out: TextOutputStream>(_ folder: String, _ work: String, to out: 
     report(&out, "fetched", started, totals.chunkBytes)
 
     if let file = try largestFile(source, record.top) {
+        // A stretch of 4 KiB is read from 64 places spread over the file, each
+        // asked for on its own, and the time one takes on average is printed: a
+        // single read is shorter than some systems' clocks can tell apart.
         let length = min(file.size, 4096)
+        let places: UInt64 = 64
         let remote = try Remote(peer: Responder(source), root: root)
         let stretch = MemorySink()
         started = DispatchTime.now()
-        try remote.read(file, offset: (file.size - length) / 2, length: length, to: stretch)
-        let taken = String(format: "%8.4f", seconds(since: started))
-        print("a stretch    \(taken) s  \(stretch.bytes.count) bytes from the middle of a file of \(file.size) bytes", to: &out)
+        for place in 0..<places {
+            stretch.bytes.removeAll(keepingCapacity: true)
+            try remote.read(file, offset: (file.size - length) * place / (places - 1), length: length, to: stretch)
+        }
+        let taken = String(format: "%8.4f", seconds(since: started) / Double(places))
+        print("a stretch    \(taken) s  \(stretch.bytes.count) bytes at a time, from \(places) places in a file of \(file.size) bytes", to: &out)
     }
 
     let written = work + "/written"

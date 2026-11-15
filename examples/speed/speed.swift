@@ -4,8 +4,10 @@
 //     swift run -c release speed [MiB [folder]]
 //
 // It prints, for a file of that many MiB of bytes that look random: chunking
-// alone, hashing alone, building the file into a store in memory, and
-// checking every chunk of it again. Without a number, the file is 1 GiB.
+// alone, hashing alone, building the file into a store in memory, checking
+// every chunk of it again, fetching it into a second store as a receiver
+// would, and writing it as a bundle and reading that into a third. Without a
+// number, the file is 1 GiB.
 //
 // With a folder, it also builds that folder from disk into a store in
 // memory, and prints the best of five runs: by then the system holds the
@@ -40,6 +42,28 @@ func filler(_ length: Int) -> [UInt8] {
 /// How many seconds have gone by since `started`.
 func seconds(since started: DispatchTime) -> Double {
     Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e9
+}
+
+/// Bytes held in memory, read from the start: a bundle, here.
+final class HeldBytes: ByteSource {
+    private let bytes: [UInt8]
+    private var at = 0
+
+    init(_ bytes: [UInt8]) {
+        self.bytes = bytes
+    }
+
+    func read(into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
+        let count = min(buffer.count, bytes.count - at)
+        if count == 0 {
+            return 0
+        }
+        bytes.withUnsafeBytes { held in
+            buffer.baseAddress!.copyMemory(from: held.baseAddress! + at, byteCount: count)
+        }
+        at += count
+        return count
+    }
 }
 
 /// A step's name, in a column of its own.
@@ -81,6 +105,22 @@ func speed<Out: TextOutputStream>(_ megabytes: Int, _ folder: String?, to out: i
     report(&out, "checked", seconds(since: started), data.count)
     let hex = String(mixed, radix: 16)
     print("root \(root) (\(hex.count < 2 ? "0" + hex : hex))", to: &out)
+
+    // The tree is fetched from the first store into a second one, as a
+    // receiver would take it from a peer, and then written as a bundle and
+    // read back into a third. Each checks every byte as it comes.
+    let fetched = MemoryStore()
+    started = DispatchTime.now()
+    _ = try fetch(fetched, root, from: Responder(store))
+    report(&out, "fetched", seconds(since: started), data.count)
+
+    let imported = MemoryStore()
+    let bundle = MemorySink()
+    bundle.bytes.reserveCapacity(data.count + (1 << 20))
+    started = DispatchTime.now()
+    try exportBundle(store, root, to: bundle)
+    _ = try importBundle(imported, root, from: HeldBytes(bundle.bytes))
+    report(&out, "bundled", seconds(since: started), data.count)
 
     if let folder {
         var best = Double.greatestFiniteMagnitude

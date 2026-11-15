@@ -19,7 +19,7 @@ final class SpeedTests: XCTestCase {
             let root = try speed(megabytes, temp.path, to: &out)
             let wanted = printed + [
                 "chunked ", "hashed ", "built ", "checked ", "root \(root)",
-                "built from disk ", " 1 different files, 8 bytes\n",
+                "fetched ", "bundled ", "built from disk ", " 1 different files, 8 bytes\n",
             ]
             for want in wanted {
                 XCTAssertTrue(out.contains(want), "\(megabytes) MiB: the example did not print \(want):\n\(out)")
