@@ -32,6 +32,13 @@ private let keptByEach = 1 << 20
 /// The most chunks of a fixed size that a window holds.
 private let fixedChunksInAWindow = 1024
 
+/// How many of a file's windows in a row must find its chunks still being kept
+/// once the next window is read, while as many helpers are free as the window
+/// could use, before its windows grow to what a builder with help holds.
+/// Helpers are free for a moment while other files are between windows, and
+/// that is not worth the memory.
+let windowsBehindToGrow = 3
+
 /// What a window holds when it starts on its first file. A window grows only as
 /// a file turns out to be longer, so a small file never costs a large one.
 private let windowStart = 64 * 1024
@@ -74,8 +81,13 @@ final class Helpers: @unchecked Sendable {
         Helpers(free: (threads == 0 ? processorCount() : threads) - 1)
     }
 
+    /// How many helpers are free.
+    var available: Int {
+        lock.withLock { free }
+    }
+
     var any: Bool {
-        lock.withLock { free > 0 }
+        available > 0
     }
 
     /// Takes up to `most` helpers, and says how many it got.
@@ -180,11 +192,18 @@ public final class Builder {
     /// Chunks, hashes and keeps a file that `read` reads, one window at a time.
     /// While the chunks of one window are hashed and kept, what is left of it
     /// goes to the start of the other, and the file is read on into that one.
+    ///
+    /// A file that starts while no helper is free is read in short windows.
+    /// They grow once keeping its chunks is what holds the file up while
+    /// helpers are free: a store that writes each chunk to a disk keeps it more
+    /// slowly than the file is read, and a longer window gives the free helpers
+    /// a share.
     func file(read: (UnsafeMutableRawBufferPointer) throws -> Int) throws -> Target {
         let store = self.store
         let chunking = self.chunking
         let helpers = self.helpers
-        let room = windowRoom(chunking, help: helpers.any)
+        var room = windowRoom(chunking, help: helpers.any)
+        var behindInARow = 0
         var items: [ChunkRef] = []
         var (filled, ended) = try fill(windows.current, 0, room, read)
         while filled > 0 {
@@ -195,15 +214,26 @@ public final class Builder {
             }
             let settledTo = chunks.reduce(0) { $0 + $1.count }
             let tail = UnsafeRawBufferPointer(rebasing: current.memory[settledTo..<filled])
-            // Once the file has ended there is nothing to read meanwhile.
-            let most = ended ? chunks.count / 2 : (settledTo + keptByEach - 1) / keptByEach
-            let refilled = try keepChunksWhile(store, helpers, most, chunks, &items) {
+            // Once the file has ended there is nothing to read meanwhile. A window
+            // takes no more helpers than it has chunks, and leaves the others to
+            // the files beside it.
+            let most = ended ? chunks.count / 2 : min((settledTo + keptByEach - 1) / keptByEach, chunks.count)
+            let refilled = try keepChunksWhile(store, helpers, most, chunks, &items) { behind in
                 Result<(Int, Bool), any Error> {
                     carry(tail, into: next, room)
                     if ended {
                         return (tail.count, true)
                     }
-                    return try fill(next, tail.count, room, read)
+                    let refilled = try fill(next, tail.count, room, read)
+                    if behind() && helpers.available >= most {
+                        behindInARow += 1
+                        if behindInARow >= windowsBehindToGrow {
+                            room = windowRoom(chunking, help: true)
+                        }
+                    } else {
+                        behindInARow = 0
+                    }
+                    return refilled
                 }
             }
             (filled, ended) = try refilled.get()
@@ -272,24 +302,27 @@ private func keepChunks(
     _ items: inout [ChunkRef]
 ) throws {
     // A helper is worth starting only for a few chunks of its own.
-    try keepChunksWhile(store, helpers, chunks.count / 2, chunks, &items) {}
+    try keepChunksWhile(store, helpers, chunks.count / 2, chunks, &items) { _ in }
 }
 
 /// Hashes and keeps chunks as `keepChunks` does, with up to `most` helpers,
 /// while this thread does `meanwhile`; then this thread takes a share too.
-/// Gives what `meanwhile` gave, once the chunks are kept. A chunk that could
-/// not be kept is the error, whatever `meanwhile` gave.
+/// `meanwhile` can ask whether helpers are still keeping the chunks. Gives
+/// what `meanwhile` gave, once the chunks are kept. A chunk that could not be
+/// kept is the error, whatever `meanwhile` gave.
 private func keepChunksWhile<T>(
     _ store: any Store,
     _ helpers: Helpers,
     _ most: Int,
     _ chunks: [UnsafeRawBufferPointer],
     _ items: inout [ChunkRef],
-    meanwhile: () -> T
+    meanwhile: (_ behind: () -> Bool) -> T
 ) throws -> T {
     let helping = helpers.take(most)
     if helping == 0 {
-        let done = meanwhile()
+        // With no helper, nothing is kept before `meanwhile` is done, and that
+        // says nothing of how fast the store keeps.
+        let done = meanwhile { false }
         for chunk in chunks {
             items.append(try keepChunk(store, chunk))
         }
@@ -299,6 +332,7 @@ private func keepChunksWhile<T>(
     let lent = Unchecked(chunks)
     let dealer = Dealer(count: chunks.count)
     let kept = Shared([ChunkRef?](repeating: nil, count: chunks.count))
+    let finished = Shared(0)
     let work: @Sendable () -> Void = {
         while let index = dealer.take() {
             do {
@@ -307,13 +341,14 @@ private func keepChunksWhile<T>(
             } catch {
                 dealer.fail(error)
             }
+            finished.with { $0 += 1 }
         }
     }
     let group = DispatchGroup()
     for _ in 0..<helping {
         DispatchQueue.global().async(group: group, execute: work)
     }
-    let done = meanwhile()
+    let done = meanwhile { finished.with { $0 } < chunks.count }
     work()
     group.wait()
     try dealer.check()
