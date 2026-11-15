@@ -170,34 +170,42 @@ private func scan(
     var hash = h
     var at = from
     while to - at >= 4 * stride {
-        let first = data + at
-        let second = first + stride
-        let third = second + stride
-        let fourth = third + stride
+        // One block of four stretches, read through one pointer: the four
+        // hashes and what they need then fit into the machine's registers.
+        let block = data + at
         var h0 = hash
         var h1: UInt64 = 0
         var h2: UInt64 = 0
         var h3: UInt64 = 0
         for i in (stride - gearWindow)..<stride {
-            h1 = roll(h1, first[i], gear)
-            h2 = roll(h2, second[i], gear)
-            h3 = roll(h3, third[i], gear)
+            h1 = roll(h1, block[i], gear)
+            h2 = roll(h2, block[i + stride], gear)
+            h3 = roll(h3, block[i + 2 * stride], gear)
         }
+        // Two bytes of each stretch a round, so that the loop's own counting is
+        // a smaller part of the work. The stride is even.
         var steps = 0
-        var matched = false
-        while steps < stride {
-            h0 = roll(h0, first[steps], gear)
-            h1 = roll(h1, second[steps], gear)
-            h2 = roll(h2, third[steps], gear)
-            h3 = roll(h3, fourth[steps], gear)
-            steps += 1
-            // Any of the four is zero under the mask when the least of them is.
-            if min(min(h0 & mask, h1 & mask), min(h2 & mask, h3 & mask)) == 0 {
-                matched = true
+        var step = 0
+        while step < stride {
+            h0 = roll(h0, block[step], gear)
+            h1 = roll(h1, block[step + stride], gear)
+            h2 = roll(h2, block[step + 2 * stride], gear)
+            h3 = roll(h3, block[step + 3 * stride], gear)
+            if h0 & mask == 0 || h1 & mask == 0 || h2 & mask == 0 || h3 & mask == 0 {
+                steps = step + 1
                 break
             }
+            h0 = roll(h0, block[step + 1], gear)
+            h1 = roll(h1, block[step + stride + 1], gear)
+            h2 = roll(h2, block[step + 2 * stride + 1], gear)
+            h3 = roll(h3, block[step + 3 * stride + 1], gear)
+            if h0 & mask == 0 || h1 & mask == 0 || h2 & mask == 0 || h3 & mask == 0 {
+                steps = step + 2
+                break
+            }
+            step += 2
         }
-        if matched {
+        if steps != 0 {
             if h0 & mask == 0 {
                 return at + steps
             }
