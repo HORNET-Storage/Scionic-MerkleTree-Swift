@@ -190,6 +190,39 @@ private func held(_ store: MemoryStore) -> [[Hash]] {
     Stored.allCases.map { store.hashes($0) }
 }
 
+/// A tree of one file of many short chunks, and the frames of its bundle. Its
+/// chunks are taken in in several batches, each while the next comes.
+private func manyChunksTree() throws -> (store: MemoryStore, root: Root, frames: [[UInt8]]) {
+    // 4,100 chunks of 64 bytes: four batches of 1,024, and a few more.
+    let store = MemoryStore()
+    let builder = Builder(store: store, chunking: try Chunking.fixed(64))
+    let root = try builder.finish(top: builder.file(bytes: longBytes(13, 64 * 4100)))
+    let bundle = MemorySink()
+    try exportBundle(store, root, to: bundle)
+    return (store, root, try framesOf(bundle.bytes[Scionic.bundleMagic.count...]))
+}
+
+/// Changes the last byte of a chunk's frame: no list names what it is then.
+private func damage(_ frame: inout [UInt8]) {
+    frame[frame.count - 1] ^= 1
+}
+
+/// A peer that answers from `store`, with the chunk `bad` damaged, and with a
+/// frame longer than was asked for after the chunk that starts the request for
+/// chunks from `overlongAt` on, when that is given.
+private func badPeer(_ store: MemoryStore, bad: Hash?, overlongAt: UInt64? = nil) -> TestPeer {
+    TestPeer(store) { request, honest in
+        var answer = honest
+        for index in answer.indices where answer[index].first == FrameTag.chunk && Hash.of(answer[index].dropFirst()) == bad {
+            damage(&answer[index])
+        }
+        if case let .chunks(_, start, _)? = try? Request(decoding: request), start == overlongAt {
+            answer.insert([UInt8](repeating: FrameTag.chunk, count: 4096), at: 1)
+        }
+        return answer
+    }
+}
+
 final class ThreadsTests: XCTestCase {
     func testOneFileIsTheSameWhateverNumberOfThreadsKeepItsChunks() throws {
         // 6,250 chunks of 16 bytes: more than a builder hands on at a time.
@@ -532,5 +565,73 @@ final class ThreadsTests: XCTestCase {
         assertFails(try readFile(damagedCopy(source, items[2].hash), file, to: out), "corrupt")
         let before = Int(items[0].length) + Int(items[1].length)
         XCTAssertTrue(out.bytes[...] == data[..<before])
+    }
+
+    func testChunksTakenInWhileMoreComeAreTakenInAsByOne() throws {
+        let (source, root, frames) = try manyChunksTree()
+        XCTAssertGreaterThan(chunkPlaces(frames).count, 4 * 1024, "several batches")
+        let imported = MemoryStore()
+        try importBundle(imported, root, from: BytesSource(bundleOf(frames)))
+        XCTAssertEqual(try contents(imported), try contents(source))
+        let fetched = MemoryStore()
+        try fetch(fetched, root, from: TestPeer(source))
+        XCTAssertEqual(try contents(fetched), try contents(source))
+    }
+
+    func testABadChunkTakenInWhileMoreComeIsWhatIsTold() throws {
+        let (source, root, frames) = try manyChunksTree()
+        let places = chunkPlaces(frames)
+        // In the first batch, which is taken in while the second comes; in the
+        // second; and the last chunk, in the last batch.
+        for bad in [100, 2_000, places.count - 1] {
+            let hash = Hash.of(frames[places[bad]].dropFirst())
+            var forged = frames
+            damage(&forged[places[bad]])
+            let imported = MemoryStore()
+            assertFails(try importBundle(imported, root, from: BytesSource(bundleOf(forged))), "notWanted", "chunk \(bad)")
+            let fetched = MemoryStore()
+            assertFails(try fetch(fetched, root, from: badPeer(source, bad: hash)), "notWanted", "chunk \(bad)")
+            for store in [imported, fetched] {
+                // What was kept is the tree's, and so are the chunks before the
+                // bad one.
+                for kind in Stored.allCases {
+                    for kept in store.hashes(kind) {
+                        XCTAssertEqual(try store.get(kind, kept), try source.get(kind, kept), "chunk \(bad)")
+                    }
+                }
+                for place in places[..<bad] {
+                    XCTAssertTrue(try store.has(.chunk, Hash.of(frames[place].dropFirst())), "chunk \(bad)")
+                }
+                XCTAssertFalse(try store.has(.chunk, hash), "chunk \(bad)")
+            }
+        }
+    }
+
+    func testAFailureAfterABadChunkThatIsBeingTakenInIsNotWhatIsTold() throws {
+        let (source, root, frames) = try manyChunksTree()
+        let places = chunkPlaces(frames)
+        // Chunk 100 is in the first batch, which is taken in while the second
+        // comes, and the failure comes in the second, at chunk 1,500.
+        let bad = Hash.of(frames[places[100]].dropFirst())
+        var forged = frames
+        damage(&forged[places[100]])
+        let failsAt = bundleOf(Array(frames[..<places[1_500]])).count
+        for (sent, damaged) in [(forged, true), (frames, false)] {
+            let stream = Stutter(bundleOf(sent), step: 1_000, failsAt: failsAt)
+            assertFails(try importBundle(MemoryStore(), root, from: stream), damaged ? "notWanted" : "stream", "damaged \(damaged)")
+        }
+        // A peer that sends a frame longer than was asked for in the answer for
+        // chunks 1,472 to 1,535.
+        for (damaged, hash) in [(true, bad as Hash?), (false, nil)] {
+            let peer = badPeer(source, bad: hash, overlongAt: 1_472)
+            assertFails(try fetch(MemoryStore(), root, from: peer), damaged ? "notWanted" : "limitExceeded", "damaged \(damaged)")
+        }
+    }
+
+    func testAStoreThatFallsOverWhileMoreChunksComeDoesNotLeaveAFetchWaiting() throws {
+        let (source, root, frames) = try manyChunksTree()
+        let bundle = bundleOf(frames)
+        assertFell(endsWithin("an import") { try importBundle(FallingOnPut(), root, from: BytesSource(bundle)) }, "an import")
+        assertFell(endsWithin("a fetch") { try fetch(FallingOnPut(), root, from: TestPeer(source)) }, "a fetch")
     }
 }

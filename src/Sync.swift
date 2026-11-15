@@ -431,8 +431,8 @@ private func askOne(_ peer: any Peer, _ request: Request, limit: Int) throws -> 
 public func fetch(_ store: any Store, _ root: Root, from peer: any Peer) throws -> Summary {
     let intake = try Intake(store: store, root: root)
     // Chunks that come one after another are held, and taken in together by
-    // several threads.
-    let frames = ChunkFrames()
+    // several threads while the next ones come.
+    let taking = TakingIn(intake)
     while true {
         let requests = intake.requests(limit: requestsPerRound)
         if requests.isEmpty {
@@ -463,21 +463,17 @@ public func fetch(_ store: any Store, _ root: Root, from peer: any Peer) throws 
                 }
                 let wanted = expected[place][taken[place]]
                 if case .chunk = wanted, frame.first == FrameTag.chunk {
-                    frames.holdCopy(frame, wanted)
-                    if frames.full {
-                        try frames.takeIn(intake)
-                    }
+                    try taking.holdCopy(frame, wanted)
                 } else {
                     // What came before is taken in first.
-                    try frames.takeIn(intake)
-                    _ = try intake.accept(frame, expected: wanted)
+                    _ = try taking.settled().accept(frame, expected: wanted)
                 }
                 taken[place] += 1
             }
         }
         // What came before a failure is taken in first, and its own failure is
         // the one given.
-        try frames.takeIn(intake)
+        try taking.finish()
         try asked.get()
         if taken.contains(0) {
             throw peerError("does not hold what the tree needs")
@@ -728,9 +724,10 @@ public func importBundle(_ store: any Store, _ root: Root, from source: any Byte
     }
     let intake = try Intake(store: store, root: root)
     // Chunks that come one after another are held, and taken in together by
-    // several threads, once the record is in. Each frame is read into a buffer
-    // of theirs, and one more buffer serves every other frame of the bundle.
-    let frames = ChunkFrames()
+    // several threads while the next ones are read, once the record is in.
+    // Each frame is read into a buffer of theirs, and one more buffer serves
+    // every other frame of the bundle.
+    let taking = TakingIn(intake)
     var frame: [UInt8] = []
     // What the intake takes changes only when it takes a frame that is not a
     // chunk's, and those are taken here.
@@ -738,17 +735,14 @@ public func importBundle(_ store: any Store, _ root: Root, from source: any Byte
     var recorded = intake.record != nil
     let read = Result<Void, any Error> {
         reading: while true {
-            switch try frames.withNextBuffer({ try readNext(source, limit: limit, into: &$0) }) {
-            case .frame where recorded && frames.nextIsChunk:
-                frames.hold(nil)
-                if frames.full {
-                    try frames.takeIn(intake)
-                }
+            switch try taking.withNextBuffer({ try readNext(source, limit: limit, into: &$0) }) {
+            case .frame where recorded && taking.nextIsChunk:
+                try taking.hold(nil)
             case .frame:
                 // The frame is moved out of the buffers first, and what came
                 // before it is taken in before it.
-                frames.withNextBuffer { swap(&frame, &$0) }
-                try frames.takeIn(intake)
+                taking.withNextBuffer { swap(&frame, &$0) }
+                let intake = try taking.settled()
                 _ = try intake.accept(frame)
                 limit = intake.frameLimit
                 recorded = intake.record != nil
@@ -761,7 +755,7 @@ public func importBundle(_ store: any Store, _ root: Root, from source: any Byte
     }
     // What came before a failure is taken in first, and its own failure is the
     // one given.
-    try frames.takeIn(intake)
+    try taking.finish()
     try read.get()
     return try intake.finish()
 }

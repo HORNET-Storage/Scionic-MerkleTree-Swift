@@ -16,6 +16,8 @@
 // frame never says which hash it belongs under. Its hash is worked out from its
 // bytes.
 
+import Dispatch
+
 /// The most chunks one request asks for.
 private let chunksPerRequest: UInt32 = 64
 
@@ -927,8 +929,12 @@ private func takeChunk(
     return (hash, at)
 }
 
-/// The most bytes of chunk frames that wait to be taken in together.
-private let chunkFramesBytes = 64 << 20
+/// The most bytes of chunk frames that wait to be taken in together. One batch
+/// is taken in while the next comes. Batches of 16 MiB, about eight chunks of
+/// the default chunking, are taken in sooner after they come than larger ones,
+/// and both stay in a processor's cache more often; smaller ones leave too few
+/// chunks to share among threads.
+private let chunkFramesBytes = 16 << 20
 
 /// The most chunk frames that wait to be taken in together, however short.
 private let chunkFramesCount = 1024
@@ -999,6 +1005,120 @@ final class ChunkFrames {
             expected.removeAll(keepingCapacity: true)
         }
         try intake.acceptChunks(buffers[..<held], expected, workers: min(cores, bytes / chunkBytesByEach + 1))
+    }
+}
+
+/// Chunk frames that are taken in by other threads while more come: one batch
+/// is held while the one before it is taken in. Anything else that is done
+/// with the intake waits until every frame before it is in, so the frames are
+/// taken in in their order, and the error is that of the first frame that is
+/// refused or cannot be kept. At most two batches are held.
+final class TakingIn {
+    /// A batch of chunk frames that another thread takes in, and what became
+    /// of it.
+    private final class Away: @unchecked Sendable {
+        let frames: ChunkFrames
+        let done = DispatchSemaphore(value: 0)
+        var taken: Result<Void, any Error> = .success(())
+
+        init(_ frames: ChunkFrames) {
+            self.frames = frames
+        }
+    }
+
+    private let intake: Intake
+    /// The frames that are held now.
+    private var held = ChunkFrames()
+    /// The frames the next batch is held in, while no batch is away.
+    private var spare: ChunkFrames? = ChunkFrames()
+    private var away: Away?
+    /// A batch that was away failed, and its failure was given.
+    private var gone = false
+    /// One batch at a time is taken in here, on a thread that the queue has of
+    /// its own, so that no batch waits for a thread.
+    private let queue = DispatchQueue(label: "scionic.taking-in")
+
+    init(_ intake: Intake) {
+        self.intake = intake
+    }
+
+    /// Lends `body` the buffer that the next frame is read into, as
+    /// `ChunkFrames.withNextBuffer` does.
+    func withNextBuffer<T>(_ body: (inout [UInt8]) throws -> T) rethrows -> T {
+        try held.withNextBuffer(body)
+    }
+
+    /// Whether the frame in the next buffer is a chunk's.
+    var nextIsChunk: Bool {
+        held.nextIsChunk
+    }
+
+    /// Holds the frame in the next buffer, as `ChunkFrames.hold` does.
+    func hold(_ expected: Arrived?) throws {
+        held.hold(expected)
+        try handOverWhenFull()
+    }
+
+    /// Holds a copy of `frame`, which is lent for the call only.
+    func holdCopy(_ frame: [UInt8], _ expected: Arrived?) throws {
+        held.holdCopy(frame, expected)
+        try handOverWhenFull()
+    }
+
+    /// Once enough frames are held, hands them to another thread to take in,
+    /// as soon as the batch before them is in.
+    private func handOverWhenFull() throws {
+        guard held.full else {
+            return
+        }
+        try back()
+        guard let next = spare else {
+            throw ScionicError.invariant("a batch was handed over with none to hold the next")
+        }
+        let batch = Away(held)
+        held = next
+        spare = nil
+        let intake = Unchecked(self.intake)
+        queue.async {
+            batch.taken = Result { try batch.frames.takeIn(intake.value) }
+            batch.done.signal()
+        }
+        away = batch
+    }
+
+    /// Waits until the batch that another thread takes in is in, and keeps its
+    /// frames to hold the next batch in. Its failure is given here, once.
+    private func back() throws {
+        if gone {
+            throw ScionicError.intakeFailed
+        }
+        guard let batch = away else {
+            return
+        }
+        batch.done.wait()
+        away = nil
+        spare = batch.frames
+        if case let .failure(error) = batch.taken {
+            gone = true
+            throw error
+        }
+    }
+
+    /// The intake, once every frame held is in.
+    func settled() throws -> Intake {
+        try back()
+        try held.takeIn(intake)
+        return intake
+    }
+
+    /// Takes in every frame that is held, and gives the failure of the first
+    /// that is refused or cannot be kept. A failure that was given already is
+    /// not given again.
+    func finish() throws {
+        if gone {
+            return
+        }
+        _ = try settled()
     }
 }
 
