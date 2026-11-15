@@ -510,4 +510,27 @@ final class ThreadsTests: XCTestCase {
             XCTAssertEqual(refusing.inner.count(.fileList), 0)
         }
     }
+
+    func testALongFileIsReadBackWholeAndStopsAtADamagedChunk() throws {
+        let data = corpusBytes("threads-read", 12 << 20)
+        let source = MemoryStore()
+        let builder = Builder(store: source, chunking: .fastCDCv1)
+        let root = try builder.finish(top: builder.file(bytes: data))
+        let file = try recordOf(source, root).top
+        XCTAssertTrue(try readFile(source, file) == data)
+        // A stretch over several chunks.
+        let (offset, length) = (1_000_003, 7 << 20)
+        let stretch = MemorySink()
+        try readRange(source, file, offset: UInt64(offset), length: UInt64(length), to: stretch)
+        XCTAssertTrue(stretch.bytes[...] == data[offset..<(offset + length)])
+
+        // Read and checked ahead, written in order: the bytes before the
+        // damaged chunk come out, and nothing from it on.
+        let items = try fileOf(source, file).items
+        XCTAssertGreaterThan(items.count, 3, "several chunks")
+        let out = MemorySink()
+        assertFails(try readFile(damagedCopy(source, items[2].hash), file, to: out), "corrupt")
+        let before = Int(items[0].length) + Int(items[1].length)
+        XCTAssertTrue(out.bytes[...] == data[..<before])
+    }
 }

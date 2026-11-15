@@ -188,18 +188,16 @@ private func writeStretch(
             throw ScionicError.sizeMismatch(what: "a stored chunk", expected: UInt64(item.length), actual: size)
         }
     }
-    for (item, start) in wanted {
+    // A long stretch is read and checked several chunks at once, ahead of what
+    // is written.
+    try ChunksAhead().lend(store, wanted.map(\.item)[...]) { place, bytes in
+        let (item, start) = wanted[place]
         let from = Int(offset > start ? offset - start : 0)
         let to = Int(min(end, start + UInt64(item.length)) - start)
-        let held = try lendChunk(store, item) { bytes in
-            do {
-                try sink.write(UnsafeRawBufferPointer(rebasing: bytes[from..<to]))
-            } catch {
-                throw streamFailure(error, "write a file's bytes")
-            }
-        }
-        guard held else {
-            throw missing("the chunk", item.hash)
+        do {
+            try sink.write(UnsafeRawBufferPointer(rebasing: bytes[from..<to]))
+        } catch {
+            throw streamFailure(error, "write a file's bytes")
         }
     }
 }
