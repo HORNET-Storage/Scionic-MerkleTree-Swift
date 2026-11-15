@@ -303,7 +303,7 @@ A sink that keeps bytes back, as a buffered one does, has a `flush` method, and 
 | Bring your own transport | `Intake`, `Request`, `Frame`, the `Peer` protocol |
 | Bring your own storage | the `Store` protocol |
 
-**Building.** Building uses every core unless `BuildOptions.workers` says otherwise. Several files are chunked at once, and the chunks of one long file are hashed several at once. A file is never held in memory whole: a builder holds up to 16 MiB of it, or up to 64 MiB while other threads help it. `BuildOptions.timestamp` writes the time into the tree's record, and the `entryExtra` of `build` attaches extra data to each entry, such as a file mode or a media type. A link or a special file in the folder is refused, or left out with `links: .skip`. It is never followed.
+**Building.** Building uses every core unless `BuildOptions.workers` says otherwise. Several files are chunked at once, and threads that are free help chunk and hash a long one. A file is never held in memory whole: a builder holds up to 16 MiB of it, or up to 64 MiB while other threads help it. `BuildOptions.timestamp` writes the time into the tree's record, and the `entryExtra` of `build` attaches extra data to each entry, such as a file mode or a media type. A link or a special file in the folder is refused, or left out with `links: .skip`. It is never followed.
 
 **Verifying and mending.** `verify` checks every list and every chunk that a store holds for a root, on every core. When bytes were harmed where they are kept, the error says which thing it is: `ScionicError.corrupt` carries its hash. With `VerifyOptions(discardDamaged: true)` the damaged parts are removed, and the next `fetch` brings back exactly those. `VerifyOptions(rechunk: true)` also chunks every file again, and refuses a file that was not chunked the standard way.
 
@@ -415,6 +415,11 @@ public protocol Store: AnyObject, Sendable {
     /// throws.
     func lend(_ kind: Stored, _ hash: Hash, to body: (UnsafeRawBufferPointer) throws -> Void) throws -> Bool
 
+    /// Reads what is kept under `hash` into `into`, when it is as long as `into`
+    /// is, and says how long it is: nil when nothing is kept. A thing of another
+    /// length is not read, and `into` is left as it was.
+    func readInto(_ kind: Stored, _ hash: Hash, _ into: UnsafeMutableRawBufferPointer) throws -> UInt64?
+
     /// Whether anything is kept under `hash`. Unless a store has its own, this
     /// asks how long the thing is, so a store that can say that without reading
     /// the bytes is not read.
@@ -430,7 +435,7 @@ public protocol Store: AnyObject, Sendable {
 
 `Stored` says which of four kinds of thing it is: a chunk, a file's chunk list, a folder's listing, or a tree's record. A store never has to understand what it holds: every byte it hands back is checked again before it is used.
 
-A store need not have `has`, `size` or `lend` of its own: unless it has, `size` reads the whole thing, and `lend` asks `get`. A store that can answer without reading the bytes should have `has` and `size`, and a store on disk should have `size` at the least: without it, seeing whether a chunk is there takes a read of the whole chunk. It should have `lend` too: the library reads chunks through it, and a store that reads each one into memory it uses again spares the system finding fresh memory for every chunk. [`examples/roundtrip`](examples/roundtrip) has a complete store that keeps each thing as a file named by its hash.
+A store need not have `has`, `size`, `lend` or `readInto` of its own: unless it has, `size` reads the whole thing, `lend` asks `get`, and `readInto` asks `lend` and copies what is lent. A store that can answer without reading the bytes should have `has` and `size`, and a store on disk should have `size` at the least: without it, seeing whether a chunk is there takes a read of the whole chunk. It should have `lend` too: the library reads chunks through it, and a store that reads each one into memory it uses again spares the system finding fresh memory for every chunk. And it should have `readInto`: where the library reads several chunks at once, or reads them to send, it hands the store memory as long as each chunk should be, and a store that looks at how long a thing is before it reads any of it reads the chunk straight there. [`examples/roundtrip`](examples/roundtrip) has a complete store that keeps each thing as a file named by its hash.
 
 ## Errors
 
@@ -525,13 +530,12 @@ The exact rules are in [`spec/FORMAT.md`](spec/FORMAT.md), under "What a receive
 
 ## Known Limitations
 
-- **One file is chunked on one core,** because where a chunk ends decides where the next begins. That is about 6.5 GiB a second on the machine above. Hashing the chunks, which is the greater part of the work, uses every core.
-- **Fetching a tree and writing a tree out use one core each.** On the disks they were tried on, the disk was the slower part.
 - **Verifying or fetching a whole tree keeps a small record in memory for every different chunk,** so that each chunk is counted once: some tens of megabytes for a terabyte.
 - **A list is taken in whole.** A file's chunk list is 36 bytes a chunk, about 18 MB for each terabyte of the file, and a folder's listing has to fit in memory.
 - **A tree is built from a folder as the folder is while it is read.** If another program changes files in it meanwhile, the tree can hold a mix of old and new. It cannot be led outside the folder.
 - **Links, special files and file permissions are not stored.** An entry's extra data has room for a caller to record a mode.
 - **A responder that tells a peer which chunks of a file it holds looks into its store for each of them.** `Responder(store, have: false)` switches that off for one that serves strangers.
+- **A responder keeps up to 64 MiB of memory between answers,** to read the chunks of the next answer into, on every core. One that serves many peers at once may read with the answering thread alone, `Responder(store, threads: 1)`, which keeps memory for one chunk.
 - **A connection has to hold 2,048 bytes of requests on their way,** which every connection over a network does. Between a `StreamPeer` and `serve`, a connection that holds nothing works all the same, and for an answerer of another make there is `StreamPeer(input:output:ahead: 0)`.
 - **On Windows, opening a file so that it cannot be led astray costs more than a plain open.** With every core at work it does not show. While a folder is being read on Windows, other programs cannot rename or delete it.
 
