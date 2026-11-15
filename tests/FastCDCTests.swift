@@ -6,6 +6,25 @@ final class FastCDCTests: XCTestCase {
         data.withUnsafeBytes { chunking.cutLengths($0) }
     }
 
+    /// The lengths of the chunks of `data`, found with `threads` threads.
+    private func onThreads(_ data: ArraySlice<UInt8>, ended: Bool, _ threads: Int) -> [Int] {
+        data.withUnsafeBytes { fastCDCLengths($0, ended: ended, threads: threads) }
+    }
+
+    /// The lengths of the chunks of `data`, each cut by the plain boundary.
+    private func plainLengths(_ data: [UInt8]) -> [Int] {
+        data.withUnsafeBytes { raw in
+            var lengths: [Int] = []
+            var offset = 0
+            while offset < raw.count {
+                let length = fastCDCBoundaryPlain(UnsafeRawBufferPointer(rebasing: raw[offset...]))
+                lengths.append(length)
+                offset += length
+            }
+            return lengths
+        }
+    }
+
     func testGearTableMatchesSeedDerivation() {
         for index in 0..<256 {
             let digest = Hash.of(bytes(FastCDC.gearSeedPrefix) + [UInt8(index)]).bytes
@@ -117,6 +136,93 @@ final class FastCDCTests: XCTestCase {
         check(zeros[..<(FastCDC.targetSize + 2)])
         XCTAssertEqual(steps.count, 4, "a cut at every place within a step of four")
         XCTAssertTrue(strict > 0 && loose > 0, "cuts under both masks")
+    }
+
+    func testChunksFoundOnThreadsAreTheChunksOfOneThread() {
+        let corpus = corpusBytes("scionic-fastcdc-v1:test:threads", 12 << 20)
+        let zeros = [UInt8](repeating: 0, count: 3 * FastCDC.maxSize + 5)
+        let lengths = [
+            0, 1, FastCDC.minSize, FastCDC.minSize + 1,
+            firstWholeHash - 1, firstWholeHash, firstWholeHash + 1,
+            FastCDC.targetSize + 3, FastCDC.maxSize, FastCDC.maxSize + 1, corpus.count,
+        ]
+        for data in lengths.map({ corpus[..<$0] }) + [zeros[...]] {
+            for ended in [true, false] {
+                let expected = onThreads(data, ended: ended, 1)
+                if ended {
+                    XCTAssertEqual(expected, data.withUnsafeBytes { Chunking.fastCDCv1.cutLengths($0) })
+                }
+                // Stretches of every length, and so ends at every place.
+                for threads in [2, 3, 5, 8, 13] {
+                    XCTAssertEqual(
+                        onThreads(data, ended: ended, threads), expected,
+                        "length \(data.count), \(threads) threads, ended \(ended)"
+                    )
+                }
+            }
+        }
+        let matches = corpus.withUnsafeBytes { matchesOnThreads($0, 1) }
+        XCTAssertTrue(matches.contains { $0.strict })
+        XCTAssertTrue(matches.contains { !$0.strict })
+        for threads in [2, 7, 24] {
+            XCTAssertEqual(corpus.withUnsafeBytes { matchesOnThreads($0, threads) }, matches)
+        }
+    }
+
+    func testAChunkIsJudgedByItsOwnHashWhereThatHoldsFewerThan64Bytes() {
+        var data = corpusBytes("scionic-fastcdc-v1:test:short-hash", 6 << 20)
+        // Three bytes whose hash matches the strict mask, as the first three that
+        // a chunk hashes: they end the first chunk.
+        data.replaceSubrange(FastCDC.minSize..<(FastCDC.minSize + 3), with: [158, 69, 185])
+        let second = FastCDC.minSize + 3
+        // 64 bytes whose own hash matches the strict mask, the last of them the
+        // 11th that the second chunk hashes. The chunk's hash holds 11 bytes
+        // there, and does not match: the chunk goes on.
+        let window = (0..<61).map { UInt8(truncatingIfNeeded: 37 + 11 * $0) } + [6, 89, 219]
+        let hash = window.reduce(UInt64(0)) { ($0 &<< 1) &+ fastCDCGear[Int($1)] }
+        XCTAssertEqual(hash & FastCDC.strictMask, 0)
+        let last = second + FastCDC.minSize + 10
+        data.replaceSubrange((last + 1 - window.count)...last, with: window)
+
+        let expected = plainLengths(data)
+        XCTAssertEqual(expected[0], second)
+        XCTAssertGreaterThan(expected[1], FastCDC.minSize + 11)
+        let matches = data.withUnsafeBytes { matchesOnThreads($0, 2) }
+        XCTAssertTrue(matches.contains(Match(at: last, strict: true)))
+        for threads in [1, 2, 4] {
+            XCTAssertEqual(onThreads(data[...], ended: true, threads), expected, "\(threads) threads")
+        }
+    }
+
+    func testAChunkIsSettledOnceItsEndIsHeld() {
+        let corpus = corpusBytes("scionic-fastcdc-v1:test:settled", 14 << 20)
+        let whole = plainLengths(corpus)
+        var ends = [0]
+        for length in whole {
+            ends.append(ends[ends.count - 1] + length)
+        }
+        XCTAssertGreaterThan(whole.count, 3, "several chunks")
+        // Around where chunks end, and where the longest kind would end.
+        var held: [Int] = []
+        for end in ends[1..<4] {
+            held += [end - 1, end, end + 1]
+        }
+        for start in ends[..<3] {
+            held += [start + FastCDC.maxSize - 1, start + FastCDC.maxSize]
+        }
+        held += [FastCDC.minSize, firstWholeHash + 5]
+        for count in held where count < corpus.count {
+            for threads in [1, 3] {
+                let settled = onThreads(corpus[..<count], ended: false, threads)
+                // A chunk that is settled is one of the whole's: nothing that
+                // comes later changes it.
+                XCTAssertEqual(settled, Array(whole.prefix(settled.count)), "held \(count)")
+                // And only the chunk that runs on past what is held is left.
+                let reach = settled.reduce(0, +)
+                let next = settled.count < whole.count ? whole[settled.count] : 0
+                XCTAssertGreaterThanOrEqual(reach + next, count, "held \(count), \(threads) threads")
+            }
+        }
     }
 
     func testSmallInputsAreSingleChunks() {

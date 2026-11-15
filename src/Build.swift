@@ -21,8 +21,9 @@ private let roomAlone = 2 * FastCDC.maxSize
 /// enough chunks to give each of them some.
 private let roomWithHelp = 8 * FastCDC.maxSize
 
-/// How many chunks of a file that lies in memory are handed on at a time.
-private let chunksAtATime = 64
+/// The least of a file that is worth a thread of its own, when several threads
+/// look through it for where its chunks may end.
+private let lookedThroughByEach = 4 << 20
 
 /// How many folders' files may wait for the threads that chunk. A folder is
 /// kept open while it has files that are not chunked yet, so this bounds how
@@ -41,10 +42,12 @@ final class Unchecked<Value>: @unchecked Sendable {
 
 /// The threads that are free to help with a long file.
 ///
-/// A file is chunked on the thread that asks for it, because where one chunk
-/// ends decides where the next begins. Hashing and keeping the chunks is the
-/// greater part of the work and needs no order, so it is shared out among that
-/// thread and the helpers that are free.
+/// Where one chunk ends decides where the next begins, so a file is chunked in
+/// order, on the thread that asks for it. A long file in memory is first looked
+/// through by the helpers that are free, each in a part of its own, for every
+/// place where a chunk may end, and is then chunked from those places alone.
+/// Hashing and keeping the chunks is the greater part of the work and needs no
+/// order, so it is shared out among that thread and the helpers that are free.
 final class Helpers: @unchecked Sendable {
     private let lock = Lock()
     private var free: Int
@@ -99,11 +102,11 @@ public final class Builder {
     private let chunker = StreamChunker()
     private let helpers: Helpers
 
-    /// A builder that hashes and keeps the chunks of one file on `threads`
-    /// threads: 1 is the calling thread alone, and zero is one thread for each
-    /// core. A file is always chunked on the calling thread. With help, a
-    /// builder holds up to 64 MiB of a long file at a time; alone it holds up
-    /// to 16 MiB.
+    /// A builder that works on one file with `threads` threads: 1 is the
+    /// calling thread alone, and zero is one thread for each core. They find
+    /// where the chunks of a file in memory end, and hash and keep the chunks
+    /// of every file. With help, a builder holds up to 64 MiB of a long file
+    /// that it reads at a time; alone it holds up to 16 MiB.
     public init(store: any Store, chunking: Chunking = .fastCDCv1, threads: Int = 0) {
         self.store = store
         self.chunking = chunking
@@ -133,21 +136,10 @@ public final class Builder {
     /// is copied on the way to the store.
     public func file(bytes: [UInt8]) throws -> Target {
         try bytes.withUnsafeBytes { all in
-            let lengths = chunking.cutLengths(all)
+            let chunks = settled(chunking, helpers, all, ended: true)
             var items: [ChunkRef] = []
-            items.reserveCapacity(lengths.count)
-            var offset = 0
-            var start = 0
-            while start < lengths.count {
-                let end = min(start + chunksAtATime, lengths.count)
-                var chunks: [UnsafeRawBufferPointer] = []
-                for length in lengths[start..<end] {
-                    chunks.append(UnsafeRawBufferPointer(rebasing: all[offset..<(offset + length)]))
-                    offset += length
-                }
-                try keepChunks(store, helpers, chunks, &items)
-                start = end
-            }
+            items.reserveCapacity(chunks.count)
+            try keepChunks(store, helpers, chunks, &items)
             return try keepList(items)
         }
     }
@@ -264,6 +256,38 @@ private func keepChunks(
         }
         items.append(item)
     }
+}
+
+/// The chunks of `data`, the start of what is left of a file, that are
+/// settled: all of them once the file has ended. Helpers that are free look
+/// through a long stretch for where its chunks may end.
+private func settled(
+    _ chunking: Chunking,
+    _ helpers: Helpers,
+    _ data: UnsafeRawBufferPointer,
+    ended: Bool
+) -> [UnsafeRawBufferPointer] {
+    var lengths: [Int] = []
+    if let size = chunking.fixedSize.map(Int.init) {
+        var left = data.count
+        while left > 0 && (ended || left >= size) {
+            let length = min(size, left)
+            lengths.append(length)
+            left -= length
+        }
+    } else {
+        let helping = helpers.take(data.count / lookedThroughByEach - 1)
+        lengths = fastCDCLengths(data, ended: ended, threads: helping + 1)
+        helpers.give(helping)
+    }
+    var chunks: [UnsafeRawBufferPointer] = []
+    chunks.reserveCapacity(lengths.count)
+    var start = 0
+    for length in lengths {
+        chunks.append(UnsafeRawBufferPointer(rebasing: data[start..<(start + length)]))
+        start += length
+    }
+    return chunks
 }
 
 /// What a builder does with a link or a special file that it finds in a folder.

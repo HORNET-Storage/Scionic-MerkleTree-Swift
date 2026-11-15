@@ -253,6 +253,186 @@ func fastCDCBoundaryPlain(_ data: UnsafeRawBufferPointer) -> Int {
     return limit
 }
 
+/// A byte that a chunk may end after, wherever the chunk began: the hash of
+/// that byte and the 63 before it has no bit of the loose mask set. `strict`
+/// says that it has no bit of the strict mask set either.
+struct Match: Equatable {
+    let at: Int
+    let strict: Bool
+}
+
+/// The first byte of a chunk whose hash holds 64 bytes, counted from the
+/// chunk's start. Hashing begins after `FastCDC.minSize` bytes.
+let firstWholeHash = FastCDC.minSize + gearWindow - 1
+
+/// The lengths of the chunks of `data`, as `Chunking.cutLengths` gives them for
+/// fastcdc-v1, with `threads` threads at work. Unless `ended`, more of the
+/// stream comes after `data`, and only the chunks that are settled are given:
+/// each whose end is found before the end of `data`, or that holds
+/// `FastCDC.maxSize` bytes. What comes after a chunk's end cannot change where
+/// the chunk ends.
+///
+/// Where a chunk ends depends on where it began, so a file's chunks follow one
+/// another. But from a chunk's 64th hashed byte on, its hash holds the 64 bytes
+/// that end there and nothing else, so it is the same wherever the chunk began.
+/// So with several threads, each first finds, in a stretch of its own, every
+/// byte where that hash matches the loose mask, and whether it matches the
+/// strict mask too. Matches are few: one in 512 KiB, on average. The chunks are
+/// then settled one after another from the matches, and only the first 63
+/// hashed bytes of each chunk are rolled over here. That gives exactly the
+/// chunks that one hash gives, rolled over a byte at a time.
+func fastCDCLengths(_ data: UnsafeRawBufferPointer, ended: Bool, threads: Int) -> [Int] {
+    let matches = threads > 1 ? matchesOnThreads(data, threads) : []
+    var lengths: [Int] = []
+    lengths.reserveCapacity(data.count / FastCDC.targetSize + 1)
+    var start = 0
+    var next = 0
+    while start < data.count {
+        let rest = UnsafeRawBufferPointer(rebasing: data[start...])
+        let length = threads > 1
+            ? boundaryFrom(rest, start: start, matches: matches, next: &next)
+            : fastCDCBoundary(rest)
+        // A chunk that runs to the end of what is held, and is shorter than the
+        // longest, may end further on.
+        if !ended && length == rest.count && length < FastCDC.maxSize {
+            break
+        }
+        lengths.append(length)
+        start += length
+    }
+    return lengths
+}
+
+/// Every match in `data` from `firstWholeHash` on, in order, found by
+/// `threads` threads, each in a stretch of its own.
+func matchesOnThreads(_ data: UnsafeRawBufferPointer, _ threads: Int) -> [Match] {
+    let count = data.count
+    guard count > firstWholeHash, let base = data.baseAddress else {
+        return []
+    }
+    let length = count - firstWholeHash
+    let workers = max(threads, 1)
+    let each = max((length + workers - 1) / workers, 1)
+    let stretches = (length + each - 1) / each
+    let bytes = Unchecked(base.assumingMemoryBound(to: UInt8.self))
+    let found = Shared([[Match]](repeating: [], count: stretches))
+    onWorkers(stretches) { stretch in
+        let from = firstWholeHash + stretch * each
+        let matches = findMatches(bytes.value, from: from, to: min(from + each, count))
+        found.with { $0[stretch] = matches }
+    }
+    return Array(found.with { $0 }.joined())
+}
+
+/// Every match among the bytes `data[from..<to]`, in order. `from` is at least
+/// 64, so that each of these bytes has the 63 before it in `data`.
+///
+/// It rolls over four stretches side by side, as `scan` does, and notes every
+/// match of the four instead of stopping at the first.
+private func findMatches(_ data: UnsafePointer<UInt8>, from: Int, to: Int) -> [Match] {
+    var found: [Match] = []
+    fastCDCGear.withUnsafeBufferPointer { table in
+        let gear = table.baseAddress!
+        let mask = FastCDC.looseMask
+        var hash: UInt64 = 0
+        for i in (from - gearWindow)..<from {
+            hash = roll(hash, data[i], gear)
+        }
+        var at = from
+        while to - at >= 4 * stride {
+            let block = data + at
+            var h0 = hash
+            var h1: UInt64 = 0
+            var h2: UInt64 = 0
+            var h3: UInt64 = 0
+            for i in (stride - gearWindow)..<stride {
+                h1 = roll(h1, block[i], gear)
+                h2 = roll(h2, block[i + stride], gear)
+                h3 = roll(h3, block[i + 2 * stride], gear)
+            }
+            var step = 0
+            while step < stride {
+                h0 = roll(h0, block[step], gear)
+                h1 = roll(h1, block[step + stride], gear)
+                h2 = roll(h2, block[step + 2 * stride], gear)
+                h3 = roll(h3, block[step + 3 * stride], gear)
+                if h0 & mask == 0 || h1 & mask == 0 || h2 & mask == 0 || h3 & mask == 0 {
+                    noteFour(&found, at + step, h0, h1, h2, h3)
+                }
+                h0 = roll(h0, block[step + 1], gear)
+                h1 = roll(h1, block[step + stride + 1], gear)
+                h2 = roll(h2, block[step + 2 * stride + 1], gear)
+                h3 = roll(h3, block[step + 3 * stride + 1], gear)
+                if h0 & mask == 0 || h1 & mask == 0 || h2 & mask == 0 || h3 & mask == 0 {
+                    noteFour(&found, at + step + 1, h0, h1, h2, h3)
+                }
+                step += 2
+            }
+            hash = h3
+            at += 4 * stride
+        }
+        while at < to {
+            hash = roll(hash, data[at], gear)
+            if hash & mask == 0 {
+                found.append(Match(at: at, strict: hash & FastCDC.strictMask == 0))
+            }
+            at += 1
+        }
+    }
+    // The four stretches of a block give their matches side by side.
+    found.sort { $0.at < $1.at }
+    return found
+}
+
+/// Notes the matches of a block's four hashes, which are at byte `at` of the
+/// first stretch and at the same place in each of the others. Matches are
+/// rare, so this is kept out of the loop that looks for them.
+@inline(never)
+private func noteFour(_ found: inout [Match], _ at: Int, _ h0: UInt64, _ h1: UInt64, _ h2: UInt64, _ h3: UInt64) {
+    for (place, hash) in [h0, h1, h2, h3].enumerated() where hash & FastCDC.looseMask == 0 {
+        found.append(Match(at: at + place * stride, strict: hash & FastCDC.strictMask == 0))
+    }
+}
+
+/// The length of the next chunk of `rest`, as `fastCDCBoundary` gives it, from
+/// the matches that were found ahead. `rest` begins `start` bytes into the data
+/// that `matches` were found in. `next` is the first match that may lie in this
+/// chunk, and is moved on past each one that is behind it.
+private func boundaryFrom(_ rest: UnsafeRawBufferPointer, start: Int, matches: [Match], next: inout Int) -> Int {
+    let n = rest.count
+    if n <= FastCDC.minSize {
+        return n
+    }
+    let limit = min(n, FastCDC.maxSize)
+    let normal = min(FastCDC.targetSize, limit)
+    // Over the first 63 hashed bytes the hash holds fewer than 64 bytes, so
+    // there it depends on where the chunk began, and is rolled here.
+    let whole = min(firstWholeHash, limit)
+    var h: UInt64 = 0
+    for i in FastCDC.minSize..<whole {
+        h = (h &<< 1) &+ fastCDCGear[Int(rest[i])]
+        if h & (i < normal ? FastCDC.strictMask : FastCDC.looseMask) == 0 {
+            return i + 1
+        }
+    }
+    while next < matches.count {
+        let found = matches[next]
+        if found.at < start + whole {
+            next += 1
+            continue
+        }
+        let i = found.at - start
+        if i >= limit {
+            break
+        }
+        if found.strict || i >= normal {
+            return i + 1
+        }
+        next += 1
+    }
+    return limit
+}
+
 /// How a tree's files are split into chunks.
 public struct Chunking: Hashable, Sendable, CustomStringConvertible {
     /// The size of every chunk but a file's last, or nil for fastcdc-v1.
