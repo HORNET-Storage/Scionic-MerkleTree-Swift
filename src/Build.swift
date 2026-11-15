@@ -352,24 +352,27 @@ public func build(
         entries.reserveCapacity(folders[index].children.count)
         for child in folders[index].children {
             let target: Target
-            let childPath: String
             switch child.kind {
             case .file:
                 guard child.index < fileTargets.count else {
                     throw ScionicError.invariant("a file was left out of the build")
                 }
                 target = fileTargets[child.index]
-                // A file's path is put together here, for the caller to see. No
-                // file is opened by it.
-                childPath = joined(folders[index].path, String(decoding: child.name, as: UTF8.self))
             case .folder:
                 guard let made = folderTargets[child.index] else {
                     throw ScionicError.invariant("a folder was made before a folder inside it")
                 }
                 target = made
-                childPath = folders[child.index].path
             }
-            let entryData = try entryExtra?(childPath, String(decoding: child.name, as: UTF8.self), child.kind) ?? ExtraData()
+            var entryData = ExtraData()
+            if let entryExtra {
+                // A file's path is put together here, for the caller to see, and
+                // only when there is a caller to see it. No file is opened by it.
+                let childPath = child.kind == .file
+                    ? joined(folders[index].path, String(decoding: child.name, as: UTF8.self))
+                    : folders[child.index].path
+                entryData = try entryExtra(childPath, String(decoding: child.name, as: UTF8.self), child.kind)
+            }
             entries.append(try Entry(nameBytes: child.name, target: target, extra: entryData))
         }
         folderTargets[index] = try builder.folder(entries)
