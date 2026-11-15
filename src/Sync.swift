@@ -327,11 +327,19 @@ public final class Responder: Peer, @unchecked Sendable {
                 return try onFrame(outOfRange)
             }
             let end = min(list.count, start + min(UInt64(count), maxChunksPerAnswer))
+            // One frame is filled again for each chunk. Memory that is used
+            // again costs much less than fresh memory for every chunk, which a
+            // system has to find and clear first. A frame that the asker keeps
+            // is copied before it is filled again.
+            var frame: [UInt8] = []
             for item in list.items[Int(start)..<Int(end)] {
                 guard let bytes = try store.get(.chunk, item.hash) else {
                     return try onFrame(notHeld)
                 }
-                try onFrame(chunkFrame(bytes))
+                frame.removeAll(keepingCapacity: true)
+                frame.append(FrameTag.chunk)
+                frame.append(contentsOf: bytes)
+                try onFrame(frame)
             }
         case let .have(file):
             guard have, let list = try fileList(file) else {
@@ -631,14 +639,14 @@ public func exportBundle(_ store: any Store, _ root: Root, to sink: any ByteSink
                 continue
             }
             let list = try folderOf(store, target)
-            try writeFrame(sink, folderListFrame(list.encode()))
+            try writeFrame(sink, tag: FrameTag.folderList, body: list.encode())
             pending.append(contentsOf: list.entries.reversed().map(\.target))
         case .file:
             if !files.insert(target.hash).inserted {
                 continue
             }
             let list = try fileOf(store, target)
-            try writeFrame(sink, fileListFrame(list.encode()))
+            try writeFrame(sink, tag: FrameTag.fileList, body: list.encode())
             for item in list.items {
                 if !chunks.insert(item.hash).inserted {
                     continue
@@ -646,7 +654,7 @@ public func exportBundle(_ store: any Store, _ root: Root, to sink: any ByteSink
                 guard let bytes = try loadChunk(store, item) else {
                     throw missing("the chunk", item.hash)
                 }
-                try writeFrame(sink, chunkFrame(bytes))
+                try writeFrame(sink, tag: FrameTag.chunk, body: bytes)
             }
         }
     }

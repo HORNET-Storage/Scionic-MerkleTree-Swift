@@ -413,6 +413,23 @@ public func writeFrame(_ sink: any ByteSink, _ frame: [UInt8]) throws {
     }
 }
 
+/// Writes the frame that `tag` and `body` make, without making it: the body of
+/// a chunk's frame is megabytes long, and is written from where it is.
+func writeFrame(_ sink: any ByteSink, tag: UInt8, body: [UInt8]) throws {
+    guard body.count < Int(UInt32.max) else {
+        throw ScionicError.limitExceeded(what: "a frame", limit: UInt64(UInt32.max), requested: UInt64(body.count) + 1)
+    }
+    var header: [UInt8] = []
+    header.appendU32(UInt32(body.count + 1))
+    header.append(tag)
+    do {
+        try sink.write(header)
+        try sink.write(body)
+    } catch {
+        throw streamFailure(error, "write a frame")
+    }
+}
+
 /// What comes next on a stream of frames.
 enum Next {
     case frame([UInt8])
