@@ -188,6 +188,10 @@ public final class Responder: Peer, @unchecked Sendable {
     private let folders = Shared(Recent<OpenFolder>())
     /// The frame that the last chunk was sent in, filled again for the next.
     private let spareFrame = Shared<[UInt8]?>(nil)
+    /// Reads the chunks of an answer ahead of sending them, into frames that
+    /// are filled again for the next answer.
+    private let spareAhead = Shared<ChunksAhead?>(nil)
+    private let threads: Int
 
     /// A responder for what `store` holds.
     ///
@@ -204,10 +208,20 @@ public final class Responder: Peer, @unchecked Sendable {
     /// Telling takes a look into the store for every chunk of the file, so a
     /// responder that serves strangers may leave it off. It then answers such a
     /// request as it does for a file it does not hold.
-    public init(_ store: any Store, recent: UInt64 = 1 << 18, have: Bool = true) {
+    ///
+    /// `threads` is how many threads read the chunks of one answer from the
+    /// store, ahead of sending them: 1 is the thread that answers alone, and
+    /// zero, the default, is one for each core. Several are worth it when
+    /// reading a chunk takes longer than sending it, as from a disk to a fast
+    /// receiver. With several, a responder keeps up to 64 MiB of memory between
+    /// answers, to read the chunks of the next one into. A responder that serves
+    /// many peers at once may give each answer one thread, which keeps memory
+    /// for one chunk.
+    public init(_ store: any Store, recent: UInt64 = 1 << 18, have: Bool = true, threads: Int = 0) {
         self.store = store
         self.recent = recent
         self.have = have
+        self.threads = threads
     }
 
     private func fileList(_ file: Hash) throws -> FileList? {
@@ -290,6 +304,24 @@ public final class Responder: Peer, @unchecked Sendable {
         try body(&frame)
     }
 
+    /// Hands `body` what reads the chunks of an answer ahead of sending them,
+    /// and keeps it for the next answer once `body` is done. As with
+    /// `withFrame`, a thread that finds it in use is given one of its own.
+    private func withAhead(_ body: (ChunksAhead) throws -> Void) rethrows {
+        let ahead = spareAhead.with { kept -> ChunksAhead in
+            defer { kept = nil }
+            return kept ?? ChunksAhead(threads: threads)
+        }
+        defer {
+            spareAhead.with { kept in
+                if kept == nil {
+                    kept = ahead
+                }
+            }
+        }
+        try body(ahead)
+    }
+
     /// Answers one request. Each frame of the answer is handed to `onFrame`. A
     /// request that is malformed is an error. A request for something the store
     /// does not hold is answered with a refusal.
@@ -354,15 +386,12 @@ public final class Responder: Peer, @unchecked Sendable {
                 return try onFrame(outOfRange)
             }
             let end = min(list.count, start + min(UInt64(count), maxChunksPerAnswer))
-            // A frame is lent to `onFrame` for the call only: the next chunk is
-            // filled into it, or into new memory where `onFrame` kept it.
-            try withFrame { frame in
-                for item in list.items[Int(start)..<Int(end)] {
-                    let held = try lent(store, .chunk, item.hash) { refill(&frame, $0) }
-                    guard held else {
-                        return try onFrame(notHeld)
-                    }
-                    try onFrame(frame)
+            // The chunks are read ahead, several at once, and sent in their
+            // order. A frame is lent to `onFrame` for the call only: the next
+            // chunk is read into it, or into new memory where `onFrame` kept it.
+            try withAhead { ahead in
+                try ahead.frames(store, list.items[Int(start)..<Int(end)]) { frame in
+                    try onFrame(frame ?? notHeld)
                 }
             }
         case let .have(file):

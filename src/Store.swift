@@ -290,17 +290,29 @@ private let aheadCount = 1024
 /// The least bytes of chunks that are worth a thread of their own.
 private let aheadBytesByEach: UInt64 = 1 << 20
 
+/// How chunks are read ahead.
+private enum Ahead {
+    /// Checked, as `lendChunk` checks them.
+    case checked
+    /// As frames to send, as the store holds them: whoever takes them checks
+    /// them.
+    case framed
+}
+
 /// Memory that a chunk is read into, by one thread at a time.
 private final class ChunkBuffer: @unchecked Sendable {
     var bytes: [UInt8] = []
 }
 
-/// Reads the chunk that `item` names into `buffer`, from its start, and checks
-/// it as `lendChunk` does. Says whether the store holds it.
-private func readInto(_ store: any Store, _ item: ChunkRef, _ buffer: inout [UInt8]) throws -> Bool {
+/// Reads the chunk that `item` names into `buffer`, from its start, as `ahead`
+/// says, and says whether the store holds it.
+private func readInto(_ store: any Store, _ item: ChunkRef, _ ahead: Ahead, _ buffer: inout [UInt8]) throws -> Bool {
     buffer.removeAll(keepingCapacity: true)
+    if ahead == .framed {
+        buffer.append(FrameTag.chunk)
+    }
     let held = try lent(store, .chunk, item.hash) { buffer.append(contentsOf: $0) }
-    if held {
+    if held && ahead == .checked {
         try buffer.withUnsafeBytes { try checkStoredChunk(item, $0) }
     }
     return held
@@ -334,12 +346,45 @@ final class ChunksAhead {
                 }
                 return true
             }
-            let read = severalAtOnce(store, batch, workers)
+            let read = severalAtOnce(store, batch, .checked, workers)
             for (index, item) in batch.enumerated() {
                 guard try read[index].get() else {
                     throw missing("the chunk", item.hash)
                 }
                 try buffers[index].bytes.withUnsafeBytes { try body(first + index, $0) }
+            }
+            return true
+        }
+    }
+
+    /// Gives `body` the frames of the chunks that `items` name, in their order,
+    /// read from the store as it holds them: whoever takes them checks them.
+    /// Where the chunks are long enough to be worth it, several are read at
+    /// once, ahead of `body`. A chunk that the store does not hold is given as
+    /// nil, and nothing after it.
+    func frames(_ store: any Store, _ items: ArraySlice<ChunkRef>, to body: ([UInt8]?) throws -> Void) throws {
+        try inBatches(items) { _, batch, workers in
+            if workers <= 1 {
+                if buffers.isEmpty {
+                    buffers.append(ChunkBuffer())
+                }
+                let buffer = buffers[0]
+                for item in batch {
+                    guard try readInto(store, item, .framed, &buffer.bytes) else {
+                        try body(nil)
+                        return false
+                    }
+                    try body(buffer.bytes)
+                }
+                return true
+            }
+            let read = severalAtOnce(store, batch, .framed, workers)
+            for index in 0..<batch.count {
+                guard try read[index].get() else {
+                    try body(nil)
+                    return false
+                }
+                try body(buffers[index].bytes)
             }
             return true
         }
@@ -371,18 +416,23 @@ final class ChunksAhead {
 
     /// Reads the chunks of `batch` into the buffers on `workers` threads, and
     /// says for each whether the store holds it.
-    private func severalAtOnce(_ store: any Store, _ batch: ArraySlice<ChunkRef>, _ workers: Int) -> [Result<Bool, any Error>] {
+    private func severalAtOnce(
+        _ store: any Store,
+        _ batch: ArraySlice<ChunkRef>,
+        _ ahead: Ahead,
+        _ workers: Int
+    ) -> [Result<Bool, any Error>] {
         while buffers.count < batch.count {
             buffers.append(ChunkBuffer())
         }
-        let shared = Unchecked((buffers: Array(buffers[..<batch.count]), batch: batch))
+        let shared = Unchecked((buffers: Array(buffers[..<batch.count]), batch: batch, ahead: ahead))
         let dealer = Dealer(count: batch.count)
         let read = Shared([Result<Bool, any Error>?](repeating: nil, count: batch.count))
         onWorkers(workers) { _ in
             while let index = dealer.take() {
                 let item = shared.value.batch[shared.value.batch.startIndex + index]
                 let buffer = shared.value.buffers[index]
-                let result = Result { try readInto(store, item, &buffer.bytes) }
+                let result = Result { try readInto(store, item, shared.value.ahead, &buffer.bytes) }
                 read.with { $0[index] = result }
             }
         }

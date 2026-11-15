@@ -223,6 +223,13 @@ private func badPeer(_ store: MemoryStore, bad: Hash?, overlongAt: UInt64? = nil
     }
 }
 
+/// The frames of a responder's answer to a request for chunks.
+private func chunksAnswer(_ responder: Responder, _ file: Hash, _ start: UInt64) throws -> [[UInt8]] {
+    var frames: [[UInt8]] = []
+    try responder.answer(Request.chunks(file: file, start: start, count: 256).encode()) { frames.append($0) }
+    return frames
+}
+
 final class ThreadsTests: XCTestCase {
     func testOneFileIsTheSameWhateverNumberOfThreadsKeepItsChunks() throws {
         // 6,250 chunks of 16 bytes: more than a builder hands on at a time.
@@ -633,5 +640,36 @@ final class ThreadsTests: XCTestCase {
         let bundle = bundleOf(frames)
         assertFell(endsWithin("an import") { try importBundle(FallingOnPut(), root, from: BytesSource(bundle)) }, "an import")
         assertFell(endsWithin("a fetch") { try fetch(FallingOnPut(), root, from: TestPeer(source)) }, "a fetch")
+    }
+
+    func testAResponderThatReadsChunksAheadAnswersAsOneThatDoesNot() throws {
+        let (source, root, frames) = try longTree("threads-responder")
+        let chunks = chunkPlaces(frames).map { frames[$0] }
+        XCTAssertGreaterThan(chunks.count, 3, "several chunks")
+        let file = try recordOf(source, root).top.hash
+        let notHeld = refusedFrame(.notHeld)
+        // The third chunk is not held: the answer is the two before it and a
+        // refusal, and nothing after.
+        let third = Hash.of(chunks[2].dropFirst())
+        let missing = try damagedCopy(source, third)
+        try missing.remove(.chunk, third)
+        let cutShort = Array(chunks[..<2]) + [notHeld]
+        for threads in [1, 2, 0] {
+            let responder = Responder(source, threads: threads)
+            XCTAssertTrue(try chunksAnswer(responder, file, 0) == chunks, "\(threads) threads")
+            XCTAssertTrue(try chunksAnswer(responder, file, 1) == Array(chunks[1...]), "\(threads) threads")
+            let lacking = Responder(missing, threads: threads)
+            XCTAssertTrue(try chunksAnswer(lacking, file, 0) == cutShort, "\(threads) threads")
+            XCTAssertTrue(try chunksAnswer(lacking, file, 2) == [notHeld], "\(threads) threads")
+        }
+        // Several threads asking one responder at once are each answered whole.
+        let responder = Responder(source)
+        let wrong = Shared(0)
+        DispatchQueue.concurrentPerform(iterations: 4) { start in
+            for _ in 0..<3 where (try? chunksAnswer(responder, file, UInt64(start))) != Array(chunks[start...]) {
+                wrong.with { $0 += 1 }
+            }
+        }
+        XCTAssertEqual(wrong.with { $0 }, 0, "answers that were not whole")
     }
 }
