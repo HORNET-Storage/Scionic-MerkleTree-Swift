@@ -60,7 +60,13 @@ final class FormatTests: XCTestCase {
         // An entry with extra data, and its leaf.
         let extra = try ExtraData().with("mode", text: "644").with("a", [0xFF])
         let named = try Entry(name: "b.txt", target: two.target, extra: extra)
-        let extraBytes: [UInt8] = [0, 2] + [0, 1] + bytes("a") + [0, 1, 0xFF] + [0, 4] + bytes("mode") + [0, 3] + bytes("644")
+        // Written a part at a time: Swift 6.0 takes too long over it in one.
+        var extraBytes: [UInt8] = [0, 2, 0, 1]
+        extraBytes += bytes("a")
+        extraBytes += [0, 1, 0xFF, 0, 4]
+        extraBytes += bytes("mode")
+        extraBytes += [0, 3]
+        extraBytes += bytes("644")
         let namedBytes = entryBytes(1, 12, two.hash, bytes("b.txt"), extraBytes)
         var encoded: [UInt8] = []
         named.encode(into: &encoded)
@@ -84,8 +90,16 @@ final class FormatTests: XCTestCase {
         // The record, and the root.
         let totals = Totals(chunks: 2, chunkBytes: 12, listBytes: 72 + both.encodedCount)
         let record = try Record(top: both.target, totals: totals, chunking: Chunking.fixed(5))
-        var recordBytes: [UInt8] = [0x20, 2] + u64be(12) + both.hash.bytes + u64be(2) + u64be(12) + u64be(totals.listBytes)
-        recordBytes += [0, 1, 0, 8] + bytes("chunking") + [0, 7] + bytes("fixed-5")
+        var recordBytes: [UInt8] = [0x20, 2]
+        recordBytes += u64be(12)
+        recordBytes += both.hash.bytes
+        recordBytes += u64be(2)
+        recordBytes += u64be(12)
+        recordBytes += u64be(totals.listBytes)
+        recordBytes += [0, 1, 0, 8]
+        recordBytes += bytes("chunking")
+        recordBytes += [0, 7]
+        recordBytes += bytes("fixed-5")
         XCTAssertEqual(record.encode(), recordBytes)
         XCTAssertEqual(record.root.hash, Hash.of(recordBytes))
         XCTAssertEqual(try Record(decoding: recordBytes), record)

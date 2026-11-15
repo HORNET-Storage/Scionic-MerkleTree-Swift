@@ -169,7 +169,15 @@ enum Oracle {
         _ totals: (UInt64, UInt64, UInt64),
         _ extra: [([UInt8], [UInt8])]
     ) -> [UInt8] {
-        [0x20, kind] + u64be(size) + hash + u64be(totals.0) + u64be(totals.1) + u64be(totals.2) + extraBytes(extra)
+        // Written a part at a time: Swift 6.0 takes too long over it in one.
+        var out: [UInt8] = [0x20, kind]
+        out += u64be(size)
+        out += hash
+        out += u64be(totals.0)
+        out += u64be(totals.1)
+        out += u64be(totals.2)
+        out += extraBytes(extra)
+        return out
     }
 
     /// The extra data of a record that says only how the tree was chunked.
