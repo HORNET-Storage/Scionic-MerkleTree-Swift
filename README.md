@@ -1,347 +1,563 @@
-# Scionic Merkle Trees (Swift)
+![nostr Badge](https://img.shields.io/badge/nostr-8e30eb?style=flat) ![Swift Badge](https://img.shields.io/badge/Swift-F05138?logo=swift&logoColor=white) <img src="https://static.wixstatic.com/media/e9326a_3823e7e6a7e14488954bb312d11636da~mv2.png" height="20"> [![CI](https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift/actions/workflows/ci.yml) ![Version](https://img.shields.io/badge/version-2.5.6-blue) ![Swift 6.0+](https://img.shields.io/badge/swift-6.0%2B-F05138) ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-A comprehensive Swift port of [Scionic-Merkle-Tree](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) — a hybrid Merkle DAG / Merkle Tree data structure that combines the folder support of IPFS Merkle DAGs with the small branches of Classic Merkle Trees.
+# Scionic Merkle Trees
 
-**Proven byte-identical with the Go implementation** — 18 cross-compatibility tests verify that Swift produces the exact same CID hashes as Go for the same input, from individual leaves to full multi-level directory DAGs, backed by a further 25 Go-parity tests covering spec vectors, fixture roots, transmission packets and fastcdc-v1 conformance.
+## Combining Merkle Trees and Merkle DAGs
 
-**Chunking**: new trees default to **fastcdc-v1 content-defined chunking** (min 512 KiB / target 2 MiB / max 8 MiB) — boundaries follow content, so an edit re-chunks only its neighborhood instead of shifting every fixed slice after it. Roots cut this way carry `"chunking": "fastcdc-v1"` in their additional data; the legacy fixed-size cutter stays available via `setChunkSize`, and verification never re-chunks, so both kinds of trees verify everywhere. The port was written for cross-implementation compatibility: Go, Rust and Swift cut bit-identical chunks for identical bytes on every platform — proven by the conformance manifest committed under `spec/fastcdc-vectors` — so content deduplicates no matter which implementation or OS produced it.
+We've designed a [new type of Merkle DAG/Merkle Tree hybrid](https://www.hornet.storage/) known as the Scionic Merkle Tree. Scionic Merkle Trees contain small branches like Classic Merkle Trees, the folder storage support of Merkle DAGs, and numbered file chunks, so anyone can sync a file by its hash and request the range of chunk numbers they are missing. LeafSync is the name of the simple protocol used to request a range of a file's chunk numbers in order to retrieve a batch of missing file chunks. Identical chunks, files and folders have identical hashes wherever they appear, so each one is stored once and sent once.
 
-## What’s Ported
+![Comparison of Many Merklized Forms. Numbered chunks and Negentropy symbiosis: Scionic Merkle Trees only. Folder storage support: IPFS Merkle DAGs and Scionic Merkle Trees. Chunked parent leaves: Scionic Merkle Trees and Classic Merkle Trees.](docs/pictures/merklized-forms.png)
 
-This is a near-complete port of the Go library. **25 source files, 294 tests, 0 skipped.** CI runs the full suite on every push across Windows (CNG/BCrypt hashing), Linux (swift-crypto/BoringSSL), and macOS (CryptoKit).
+This repository is the **Swift implementation**, at **version 2.5.6**. The Scionic tree format is specified in [`spec/FORMAT.md`](spec/FORMAT.md). The Rust library is the reference for it, and this library is held to the same test vectors, under [`spec/`](spec), byte for byte.
 
-### Core (fully ported)
+Scionic Merkle Trees maintain the advantages of IPFS Merkle DAGs with the slim Merkle Branches of Classic Merkle Trees, while providing LeafSync as a new feature that complements any set reconciliation system (IBLTs, negentropy, et al.). In plant grafting, the "Scion" is the upper part of the plant, chosen for its desirable fruits or flowers; it's grafted onto another plant's base to grow together. In a similar vein, the Scionic Merkle Tree was born from grafting together Merkle Trees and Merkle DAGs. This process emphasizes why we use the term "Scion" for the Scionic Merkle Trees: it symbolizes the digital grafting of these two similar data structures, combining their strengths into one piece of software.
 
-| Go File | Swift File | Status | Description |
-|---------|-----------|--------|-------------|
-| `dag/types.go` | `src/dag/Types.swift` | ✅ Complete | All types: Dag, DagLeaf, DagBuilder, DagLeafBuilder, ClassicTreeBranch, DagBranch, TransmissionPacket, BatchedTransmissionPacket, DagBuilderConfig, LeafType, LeafProcessor |
-| `dag/leaves.go` | `src/dag/Leaves.swift` | ✅ Complete | BuildLeaf, BuildRootLeaf, VerifyLeaf, VerifyRootLeaf (standalone root CID verification plus full-DAG ContentSize/DagSize validation), VerifyChildrenAgainstMerkleRoot, GetBranch, VerifyBranch, HasLink, AddLink, Clone, EstimateSize |
-| `dag/dag.go` | `src/dag/DagCreation.swift` + `src/dag/DagVerification.swift` + `src/dag/ChunkOrder.swift` + `src/dag/ParentIndex.swift` | ✅ Complete | CreateDag, CreateDagAdvanced, CreateDagCustom, CreateDagWithConfig, true chunked file reads, parallel creation (DispatchQueue worker pool), Verify (full + partial with Merkle proofs), IterateDag, CreateDirectory, GetContentFromLeaf, GetPartial, CalculateLabels, GetHashesByLabelRange, GetLabel, IsPartial, chunkIndexFromItemName / compareChunkItemNames, minimumParentIndex |
-| `dag/fastcdc.go` + `dag/fastcdc_gear.go` | `src/dag/FastCDC.swift` | ✅ Complete | fastcdc-v1 content-defined chunking (the default mode): frozen gear table + seed derivation, normative boundary loop, mode dispatch, streaming cutter with an 8 MiB window, public `cutChunks`, root chunking tag |
-| `dag/serialize.go` | `src/dag/Serialization.swift` | ✅ Complete | ToJSON, FromJSON, ToCBOR, FromCBOR, ReadDag, ToSerializable, FromSerializable (rebuilds Merkle trees + parent hashes). Both formats are written from one shared wire tree, so field names and order cannot drift between them |
-| `dag/transmission.go` | `src/dag/Transmission.swift` | ✅ Complete | GetLeafSequence (BFS with proofs), VerifyTransmissionPacket, ApplyTransmissionPacket, ApplyAndVerifyTransmissionPacket, RemoveAllContent, GetBatchedLeafSequence (size-limited batches), VerifyBatchedTransmissionPacket, ApplyBatchedTransmissionPacket, BatchedTransmissionPacket.GetRootLeaf |
-| `dag/store.go` | `src/dag/Store.swift` | ✅ Complete | LeafStore, ContentStore, batch/count/enumerator/cache protocols, DagStore verification/streaming verification without full DAG materialization, index build/cache/iterate/update-parent-hash APIs, MemoryLeafStore + MemoryContentStore |
-| `dag/utils.go` | `src/dag/Utils.swift` | ✅ Complete | SortMapByKeys, SortMapForVerification, KeyValue, CalculateTotalContentSize, CalculateTotalDagSize |
-| `diff/diff.go` | `src/diff/Diff.swift` | ✅ Complete | Diff, DiffFromNewLeaves, GetAddedLeaves, GetRemovedLeaves, ApplyToDAG, CreatePartialDag |
-| `merkletree/merkletree.go` | `src/classic-merkle-tree/*.swift` | ✅ Complete | Full Classic Merkle Tree: build from map, proof generation, proof verification, configurable hash function, OpenZeppelin-compatible sorting, parallel leaf hashing, parent hashing, and proof updates via `runInParallel` + `numRoutines`, GetIndexForKey |
-| `tree/tree.go` | `src/classic-tree-wrapper/TreeContent.swift` | ✅ Complete | TreeContent, TreeLeaf, Build, VerifyTree, VerifyRoot |
+## Contents
 
-### Internal (implemented from scratch, no external deps)
+- [Scionic Merkle Trees: The Best of Both Worlds](#scionic-merkle-trees-the-best-of-both-worlds)
+- [Scionic Merkle Branch Statistics](#scionic-merkle-branch-statistics)
+- [Syncing by File Hash and Chunk Number](#syncing-by-file-hash-and-chunk-number)
+- [What's New in 2.5.6](#whats-new-in-256)
+- [Documentation](#documentation)
+  - [Install](#install)
+  - [Quick Start](#quick-start)
+  - [Syncing Between Two Stores](#syncing-between-two-stores)
+  - [Syncing Over a Connection](#syncing-over-a-connection)
+  - [What Else It Does](#what-else-it-does)
+  - [Stores](#stores)
+  - [Errors](#errors)
+  - [Words Used in the API](#words-used-in-the-api)
+  - [Performance](#performance)
+  - [Security](#security)
+  - [Known Limitations](#known-limitations)
+  - [Specification and Test Vectors](#specification-and-test-vectors)
+  - [Other Implementations](#other-implementations)
+  - [Development](#development)
+  - [License](#license)
 
-| Component | Swift File | What it replaces |
-|-----------|-----------|------------------|
-| CBOR Encoder/Decoder | `src/internal/CBOR.swift` | `fxamacker/cbor/v2` — deterministic encoding matching Go’s defaults |
-| SHA-256 backend | `src/internal/SHA256Backend.swift` | swift-crypto's portable-C fallback on Windows — the default hash path is CNG/`BCryptHashData` there (9.4× raw throughput); Apple and Linux delegate to swift-crypto |
-| Wire JSON writer | `src/internal/WireJSON.swift` | `encoding/json` (`MarshalIndent`) — Go’s exact indentation, escaping and separators, written from the same wire tree the CBOR encoder reads |
-| Wire JSON parser | `src/internal/WireJSONParser.swift` + `WireJSONSchema.swift` | `encoding/json` (`Unmarshal`) — order-preserving parse plus a schema-directed walk back into that wire tree |
-| CID Generation | `src/internal/CID.swift` | `go-cid` + `go-multihash` + `go-multicodec` — CIDv1 with CBOR codec (0x51) + SHA2-256 |
-| Base32lower | `src/internal/BaseEncoding.swift` | `go-multibase` — RFC 4648 lowercase, no padding |
-| Base58btc | `src/internal/BaseEncoding.swift` | `mr-tron/base58` — Bitcoin-style encoding |
-| Varint | `src/internal/Varint.swift` | `go-varint` — unsigned LEB128 |
+## Scionic Merkle Trees: The Best of Both Worlds
 
-## Cross-Compatibility Proof
+### Scionic Merkle Tree
 
-**18 cross-compatibility tests** (`tests/tests/crosscompat/`) verify byte-identical output between Go and Swift at every level of the stack:
+![Scionic Merkle Tree: the root is the hash of the record, which names the folder on top. Each folder lists its entries by name and each file lists its chunks by number, and a Classic Merkle tree inside each one covers its list. Every link ends at a box that holds what the hash covers: the count, the size and the Classic Merkle root.](docs/pictures/scionic-merkle-tree.png)
 
-| Layer | Test | Verified |
-|-------|------|----------|
-| Classic Merkle Tree | 2-, 3- and 5-leaf trees, plus CID-like keys | Root hashes + proof paths + siblings match |
-| Individual leaf hashing | file, chunk, directory leaves | CID strings match |
-| Leaf with content | SHA-256 content hash | CID matches |
-| Leaf with metadata | AdditionalData map | CID matches |
-| Full DAG (manual) | 2 files + root directory | Root hash + child hashes + LeafCount + ContentSize + DagSize match |
-| Full DAG (filesystem) | 3 files + 1 subdir | Root hash matches, verify passes, directory recreation matches |
-| **Deep directory** | **7 files, 4 subdirs, 3 levels deep** | **All 12 leaf hashes match, verify passes, all file contents recreated correctly** |
-| Wire format | Go skeleton and selected-leaf vectors, batched packet shape | Decodes and verifies against golden Go bytes; legacy counter-free packets stay decodable |
+### Scionic Merkle Branch
 
-A further **25 Go-parity tests** sit outside that directory: `SpecVectorParityTests` (9) walks the shared spec-vector corpus — committed under `spec/vectors` and byte-identical across the Go, Rust, and Swift repositories — `TransmissionParityTests` (9) covers packet flows, `FixtureRootParityTests` (3) pins the standard fixture roots, and `FastCDCVectorTests` (4) rebuilds the fastcdc-v1 conformance manifest committed under `spec/fastcdc-vectors`: chunk boundaries, chunk digests, edit-reuse partitions, DAG root CIDs and the root chunking tag, all against the values Go generated.
+![Scionic Merkle Branch: one chunk of a file, proven against the root. Each folder and file on the way shows one item of its list with a few hashes beside it. At each step the count, the size and the Classic Merkle root are hashed, and must give the hash held just above. The rest of the tree is never sent.](docs/pictures/scionic-merkle-branch.png)
 
-The deep directory test creates this structure in both Go and Swift:
+### Classic Merkle Trees
+
+Merkle Trees are cryptographic structures used to manage and securely verify large amounts of data. However, there's a significant drawback: they cannot store folders of files.
+
+The number of hashes required for a Merkle proof in a Classic Merkle Tree grows logarithmically with the number of file chunks, meaning the growth rate slows as the tree grows. This pattern makes them very efficient for large datasets.
+
+### Scionic Merkle Trees vs. IPFS Merkle DAGs
+
+Merkle DAGs were developed as a solution to incorporate folders of files, addressing a key limitation of Classic Merkle Trees. However, this structure has its own challenge: to securely download a single file chunk, you must download the hash of every other file chunk inside the folder it's stored in. Each parent leaf keeps growing as the folder grows, even though the size of each Merkle chunk should always remain the same.
+
+Scionic Merkle Trees resolve this flaw, because each Scionic parent leaf is itself chunked using a Classic Merkle Tree, ensuring every part of the Scionic Merkle Tree is uniformly small. In the most extreme cases of P2P decentralization, a user could retrieve each Merkle branch from a different source without needing to download the entire parent leaf first.
+
+### Folders and Subfolders of Files
+
+Like Merkle DAGs, Scionic Merkle Trees can accommodate storing folders of files. An entire directory of files and subfolders can be converted into a Scionic Merkle Tree, and a single file can be a tree on its own.
+
+### Content-Defined File Chunking
+
+Files are split into chunks with content-defined chunking (FastCDC): chunk boundaries are derived from the bytes themselves rather than from fixed offsets, so identical content produces identical chunks no matter where it appears. Editing a large file no longer shifts every boundary after the edit: only the chunks around the edit change, and every other chunk is reused.
+
+Chunk sizes are bounded: more than 512 KiB, 2 MiB on average, and 8 MiB at most, with only a file's last chunk allowed to be smaller. No crafted content can produce a flood of tiny chunks or one giant chunk to stall producers, verifiers or transports. The algorithm is frozen as `fastcdc-v1` in [`spec/FORMAT.md`](spec/FORMAT.md) and pinned by the vectors in [`spec/fastcdc-vectors`](spec/fastcdc-vectors), so every implementation cuts the same bytes at the same places.
+
+### Deduplication at Every Level
+
+A hash covers what a thing is, and never where it sits:
+
+- **A chunk's hash** is the SHA-256 of its bytes, and nothing else.
+- **A file's hash** covers the ordered list of its chunks. It does not cover the file's name.
+- **A folder's hash** covers its entries: each name with the hash under it. It does not cover the folder's own name.
+
+So the same chunk, the same file and the same folder have the same hash in every tree. A store keeps each of them once, and a sync skips whatever the receiver already holds, whichever tree it first arrived with. A renamed file, a copied folder, and a new version of a large file that changes a few megabytes each cost only what is new.
+
+### Chunked Parent Leaves
+
+Within each parent leaf, the list of children is organized as a Classic Merkle Tree rather than one potentially large list of hashes. This holds for a folder with its entries and for a file with its chunks. Large files and large folders lead to very long lists, and chunking the parent leaf with a Classic Merkle Tree avoids that scaling problem.
+
+- **A folder's Classic Merkle Tree** covers its entries, in the order of their names.
+- **A file's Classic Merkle Tree** covers its chunks, in the order they have in the file. A chunk's number is its place in that tree, so a chunk cannot be shown under a number it does not have.
+
+The top of each tree is its Classic Merkle root. The hash of a folder or of a file covers three things: how many items its list has, its size in bytes, and its Classic Merkle root. That hash is what a parent holds for its child, and what the tree's record holds for the folder or file on top. In the pictures above, every folder and file shows those three in a box, and every link by hash ends at that box.
+
+A large file has far more chunks than most folders have entries: about 500,000 for a file of a terabyte. A file of 512 KiB or less is a single chunk, and its tree is that one leaf.
+
+### File Chunk Downloading with Chunked Parent Leaves
+
+If a user wants to download a specific file chunk within a Scionic Merkle Tree, they no longer need to download the hash of every other chunk of its file, or the listing of every other file in its folder. Instead, they download a Classic Merkle branch for each parent on the way down from the root. This allows the user to verify that the chunk is part of the tree without the rest of it.
+
+### One Place for Every Name
+
+A folder's entries are sorted by name, and every fork of the folder's Merkle tree records the name at which its right half begins. A name can therefore sit in exactly one place. One branch proves that a name is in a folder and what it holds, and the same kind of branch proves that a name is *not* in the folder. A publisher cannot show one file under a name to a reviewer and a different file under the same name to everyone else.
+
+## Scionic Merkle Branch Statistics
+
+*Comparing the size of a Scionic Merkle Branch to the whole parent leaf that a Merkle DAG has you download.* These are bytes on the wire in version 2.5.6, measured by [`examples/proofsizes`](examples/proofsizes). The tests hold this table to that program.
+
+**One file out of a folder**, proven by its name:
+
+| Entries in the folder | The whole folder listing | A Scionic branch | Smaller by |
+| ---: | ---: | ---: | ---: |
+| 10 | 610 bytes | 300 bytes | **2x** |
+| 1,000 | 61 KB | 648 bytes | **94x** |
+| 10,000 | 610 KB | 880 bytes | **693x** |
+| 1,000,000 | 61 MB | 1,228 bytes | **50,000x** |
+
+**One chunk out of a file**, proven by its number:
+
+| Chunks in the file | About | The file's whole chunk list | A Scionic branch | Smaller by |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 20 MB | 360 bytes | 219 bytes | **2x** |
+| 1,000 | 2 GB | 36 KB | 459 bytes | **78x** |
+| 10,000 | 20 GB | 360 KB | 619 bytes | **582x** |
+| 500,000 | 1 TB | 18 MB | 819 bytes | **22,000x** |
+
+```sh
+swift run -c release proofsizes
 ```
-testdir/
-├── readme.txt
-├── docs/
-│   ├── guide.txt
-│   └── api.txt
-├── src/
-│   ├── main.txt
-│   └── lib/
-│       ├── utils.txt
-│       └── helpers.txt
-└── data/
-    └── config.txt
-```
 
-Both produce root hash `bafireidb74bnd3jalcdjrog3sgnfdkxblqlphtkvbycksk3qpvrzbwzntu` — every leaf, every directory, every byte.
+Scionic Merkle Trees incorporate Classic Merkle Trees within their structure, so their branches grow logarithmically: each time a folder or a file doubles in size, a branch through it grows by one step. In stark contrast, a parent leaf in an IPFS Merkle DAG grows linearly, because the hash of every child must be downloaded to check any one of them.
 
-### JSON is byte-identical too
+## Syncing by File Hash and Chunk Number
 
-Both wire formats are written from one shared wire tree: the JSON writer
-reproduces Go's `MarshalIndent` output exactly (field names, declaration
-order, indentation, escaping, `null` for absent optionals), and the CBOR
-encoder reads the same tree, so the two formats cannot drift apart. There are
-deliberately **no `Codable` conformances** — reaching for `JSONEncoder` would
-silently emit a document no other port reads. Read back, JSON goes through
-this port's own order-preserving parser and a schema-directed walk into that
-same tree.
+A Scionic Merkle Tree says what is in it. The root names what is on top, a folder lists its entries, and a file lists its chunks. **LeafSync** is the protocol that fetches from it. A receiver asks for:
 
-The corpus commits a `.json` sibling for every `.cbor` artifact, and every
-port asserts per artifact that re-encoding reproduces the committed JSON bytes
-*and* that the value decoded from JSON re-encodes to the committed CBOR bytes —
-which is what makes the two decoders provably equivalent rather than merely each
-self-consistent. One case, `json_metadata_probe`, carries `AdditionalData` keys
-of lengths 1, 8 and 9: the only input class that can distinguish CBOR's
-length-first key order from JSON's plain bytewise order, and therefore the only
-vector in the corpus that can fail for that reason.
+- **a file by its hash, and its chunks by their numbers**: chunks 100 to 200 of this file;
+- **a range of a file's bytes**, for which only the chunks that hold those bytes are sent;
+- **one name of a folder**, or a range of its entries.
 
-## Performance
+A chunk's number is its position in its file's list, and the file's hash covers that list, so nobody can lie about a number. A file's hash is the same in every tree, so the same request means the same thing wherever the file appears.
 
-Measured on Windows (Swift 6.3.1, 24 CPUs) against the Go reference and the
-Rust port: same 18.25 MiB corpus, 256 KiB chunks, min of 15 samples, all three
-harnesses back to back in one session. Every harness prints its DAG root and
-encoded sizes first, and all three match at every chunk size, so the timings
-compare equal work. The same session is recorded from the Rust side in the
-Rust repository's README. Go is the anchor column; lower is better:
+### Negentropy Symbiosis
 
-| Workload | Swift | Go | Rust | Swift vs Go |
-|---|---:|---:|---:|---|
-| `create_sequential` | 53.48 ms | 15.80 ms | 18.66 ms | 3.4× slower |
-| `create_parallel` | 9.66 ms | 4.80 ms | 3.46 ms | 2.0× slower |
-| `verify` | 17.44 ms | 10.93 ms | 5.02 ms | 1.6× slower |
-| `to_cbor` | 9.95 ms | 3.57 ms | 4.71 ms | 2.8× slower |
-| `from_cbor` | **3.02 ms** | 3.16 ms | 3.09 ms | parity |
-| `to_json` | 81.38 ms | 79.75 ms | 67.09 ms | parity |
-| `from_json` | 61.43 ms | 70.78 ms | 48.29 ms | **1.15× faster** |
-| `leaf_sequence` | **0.32 ms** | 2.79 ms | 2.63 ms | **8.7× faster** |
-| `batched_sequence` | 0.291 ms | 0.089 ms | 0.102 ms | 3.3× slower |
+LeafSync complements any set reconciliation system, such as Negentropy. Each does the part it is suited to:
 
-`from_cbor` and `leaf_sequence` lead all three ports, and `from_json` is ahead
-of Go. Implementation notes behind the hot paths:
+- **Set reconciliation syncs the Merkle roots, and the file hashes that link to each root.** Two sides work out which roots, and which files under a root, one of them holds and the other is missing. These are small sets: one hash for a tree and one for a file.
+- **LeafSync then syncs the chunks of each file.** A file's chunks are numbered, so a receiver asks for the ranges of numbers it is missing. Chunk hashes are never reconciled as a set. They are by far the largest set, about 500,000 for a terabyte of files, and set reconciliation costs memory and work for every hash in the set.
 
-- **SHA-256 on Windows goes through CNG/BCrypt**
-  (`src/internal/SHA256Backend.swift`). swift-crypto's vendored BoringSSL ships
-  only `__ELF__`/`__APPLE__` assembly, so on Windows its SHA-256 runs as
-  portable C: 449 MB/s against 4,199 MB/s through `BCryptHashData` on the same
-  machine — 9.4× one-shot, and BCrypt is faster at every input size down to
-  64 B (287 ns vs 515 ns per hash). Apple and Linux delegate to swift-crypto,
-  which on Apple platforms re-exports CryptoKit and is already
-  hardware-accelerated.
-- **The CBOR encoder writes into one exactly pre-sized `[UInt8]` buffer**
-  (`CBOREncoder.encodedSize` mirrors the encoder case for case) instead of
-  growing a `Data` incrementally.
-- **Default Merkle pair hashing streams both siblings into one hasher**
-  instead of concatenating them into a fresh buffer per pair.
-- **`getLeafSequence` builds each parent's proof tree once per parent** rather
-  than once per child, which is why it leads both other ports.
+This library provides LeafSync. It holds no set reconciliation of its own, and works beside whichever one an application runs. A receiver that has nothing but a root needs none at all: it walks down from the root, skips everything it already holds by its hash, and asks for the rest.
 
-Two honest caveats. The Windows Swift 6.3.1 toolchain ships a standard library
-built `+assertions` — a cost the Go and Rust toolchains do not carry, and
-`-c release` cannot remove from the stdlib — so some share of the
-create/verify gap is toolchain rather than port. And Windows is a proxy for
-the production target: the encoder/allocation characteristics are expected to
-transfer to iOS, the BCrypt backend does not exist there (Apple builds hash
-through CryptoKit), and absolute iOS numbers remain unmeasured until the
-suite runs on a device. CI does run the full suite on Linux and macOS as
-well, so both non-Windows hash backends are exercised on every push.
+A phone can read one file out of a tree of terabytes and hold almost nothing. Which chunks of a file a peer holds is one bit per chunk: about 60 KB for a file of a terabyte. Different ranges of one file can be requested from different peers at the same time.
 
-## Features
+**Everything is verified on arrival.** Every answer is checked against a hash that has already been checked, all the way back to the root, before it is kept or passed on. Nothing is trusted because of who sent it.
 
-- **Directory support** — entire directory trees become Scionic Merkle DAGs, like IPFS
-- **Small Merkle branches** — logarithmic proof sizes via Classic Merkle Trees inside parent leaves
-- **Content-defined chunking (fastcdc-v1)** — the default: boundaries follow content, so edits re-chunk only their neighborhood; byte-identical across Go, Rust and Swift, with the legacy fixed cutter still available via `setChunkSize`
-- **LeafSync** — numbered leaves with label-based range queries for synchronization
-- **Streaming I/O** — files are read with `FileHandle` chunks; fastcdc streams through one reusable 8 MiB window per file
-- **Storage-backed verification** — `DagStore.verifyStreaming()` verifies via metadata-first store access without calling `toDag()`
-- **Indexed storage traversal** — cache-backed `DagIndex` APIs support fast parent/child traversal and parent-hash updates
-- **Parallel creation** — `createDagWithConfig` with `enableParallel: true` uses DispatchQueue worker pools
-- **Parallel classic trees** — `MerkleTreeConfig(runInParallel:numRoutines:)` parallelizes leaf and parent-node hashing
-- **Verification** — full DAG verification + partial DAG verification with stored Merkle proofs
-- **ContentSize/DagSize validation** — root leaf recalculates and verifies sizes from children when a full DAG is available
-- **Serialization** — JSON and CBOR, both byte-identical to Go; one shared wire tree feeds both writers, and both parsers feed it back
-- **Transmission** — individual and size-limited batched packets; current batches carry deterministic packet counters for bounded sliding-window transports, while legacy counter-free packets remain decodable
-- **Diffing** — compute diffs between DAG versions, apply diffs, create partial DAGs from diffs
-- **Persistent storage** — LeafStore/ContentStore protocol-based backends with MemoryStore implementations
-- **Cross-platform** — builds and tests pass on macOS, iOS, Linux, and Windows
+## What's New in 2.5.6
 
-## Requirements
+Version 2.5.6 is a new tree format, built for deduplication and for trees of a terabyte and more. It does not read trees made by 2.4.x, and the same folder has a different root than it had there.
 
-- Swift 5.9+
-- Platforms: macOS 12+, iOS 15+, Linux, Windows
+- **Deduplication comes first.** A chunk's hash covers its bytes alone and a file's hash covers its chunks alone. Names and chunk numbers moved into the parent. Earlier versions hashed a chunk's number into the chunk and a file's name into the file, so the same bytes had different hashes in different places.
+- **LeafSync numbers a file's chunks, not a tree's leaves.** Earlier versions numbered every leaf of a tree. It now asks for a file by its hash and for its chunks by their numbers within that file, which the file's hash covers. Set reconciliation is left with the small sets: the Merkle roots, and the file hashes that link to them.
+- **A folder has one place for each name,** so one branch proves that a name is in a folder, or that it is not.
+- **Hardened against forged data.** A made-up leaf, a file that comes back short, a chunk that belongs to another file, and a store that is tricked into handing back other bytes are each refused, and each has a test.
+- **Bounded memory and work.** Every request says how long its answer may be, a tree's record says how much the tree holds, and writing a tree out counts what it would create before it creates anything.
+- **Built for terabytes.** Building and verifying use every core, a file is never held in memory whole, a damaged chunk is named by its hash and fetched again on its own, and any byte range of a file can be read without the rest of it.
+- **Safe on disk.** A link is never followed, in building or in writing out, even when one is swapped in while the work is under way.
+- **A new API.** `createDag`, `Dag` and the transmission packets of 2.4.x are replaced by `build`, `verify`, `fetch`, `serve` and `Remote`.
 
-## Installation
+# Documentation
 
-### Swift Package Manager
+## Install
 
-Add to your `Package.swift`:
+Add the package to the dependencies in your `Package.swift`, and its library to a target's:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift.git", from: "2.4.3"),
-]
+    .package(url: "https://github.com/HORNET-Storage/Scionic-MerkleTree-Swift", from: "2.5.6"),
+],
+targets: [
+    .target(name: "MyApp", dependencies: [
+        .product(name: "ScionicMerkleTree", package: "Scionic-MerkleTree-Swift"),
+    ]),
+],
 ```
 
-Then add `"ScionicMerkleTree"` as a dependency of your target.
+The module is named `ScionicMerkleTree`:
 
-## Usage
+```swift
+import ScionicMerkleTree
+```
 
-### Create a DAG from a directory
+| Requirement | |
+| --- | --- |
+| Swift | 6.0 or newer |
+| Systems | Linux, macOS and Windows, each tested on every push, and iOS, built on every push |
+| Dependencies | `swift-crypto` on Linux and Android. Apple's systems hash with CryptoKit and Windows with CNG |
+| Foundation | not used by the library |
+
+## Quick Start
+
+Turn a folder into a Scionic Merkle Tree, verify it, read a file out of it, and write the tree back to disk:
 
 ```swift
 import ScionicMerkleTree
 
-let dag = try createDag(path: "/path/to/directory", timestampRoot: false)
-try dag.verify()
-try dag.createDirectory(path: "/path/to/output")
-```
+// A store keeps chunks and lists by their hashes. This one is in memory.
+let store = MemoryStore()
 
-### Chunking
+// Build a tree from a folder. The root depends on the folder's contents
+// alone: not on where the folder is, what it is called, or how many
+// threads built it.
+let root = try build(store, path: "models/my-model")
+print(root) // bafkrei...
 
-fastcdc-v1 content-defined chunking is the default: boundaries follow content
-(min 512 KiB / target 2 MiB / max 8 MiB), so inserting bytes into a large file
-re-chunks only the edited neighborhood instead of shifting every fixed slice
-after it. Roots cut this way carry `"chunking": "fastcdc-v1"` in their
-additional data; an absent tag means legacy fixed-size chunks. Verification
-never re-chunks, so trees cut by either mode verify everywhere.
+// Verify everything the store holds for that root: every list, every chunk.
+let summary = try verify(store, root)
+print("\(summary.files) files, \(summary.record.top.size) bytes")
 
-```swift
-// Default: fastcdc-v1 content-defined chunking
-let dag = try createDag(path: "/path/to/directory", timestampRoot: false)
-
-// Pin the legacy fixed-size cutter (what the spec-vector corpus pins)
-setChunkSize(defaultChunkSize)
-defer { setDefaultChunkSize() } // restore fastcdc-v1
-
-// Chunk in-memory content exactly the way the DAG builders do
-let chunks = cutChunks(data)
-```
-
-### Serialize / Deserialize
-
-```swift
-// JSON
-let jsonData = try dag.toJSON()
-let restored = try Dag.fromJSON(jsonData)
-
-// CBOR (binary, more compact)
-let cborData = dag.toCBOR()
-let restored2 = try Dag.fromCBOR(cborData)
-
-// Read from file
-let dag = try Dag.readDag(path: "/path/to/dag.cbor")
-```
-
-### Transmission (LeafSync)
-
-```swift
-// Individual packets
-let packets = dag.getLeafSequence()
-for packet in packets {
-    try receiver.applyAndVerifyTransmissionPacket(packet)
+// Read one file by its path in the tree.
+if let entry = try lookup(store, root, path: "config.json") {
+    let content = try readFile(store, entry.target)
+    print("config.json holds \(content.count) bytes")
 }
 
-// Batched (size-limited, with PacketIndex/TotalPackets transport metadata)
-let batches = dag.getBatchedLeafSequence()
-for batch in batches {
-    try receiver.applyAndVerifyBatchedTransmissionPacket(batch)
+// Write the whole tree back out, to a path that does not exist yet.
+try writeToDisk(store, root, to: "restored")
+```
+
+A root is written as a CID that begins `bafkrei`. `Root` gives it as its `text`, `Root(text:)` reads one back, and only that one spelling of a root is read.
+
+## Syncing Between Two Stores
+
+Anything that answers requests is a peer: a connection to another machine, or a store in the same program. This example runs as it stands.
+
+```swift
+import ScionicMerkleTree
+
+// A publisher builds a tree. Here it is built from bytes in memory.
+let publisher = MemoryStore()
+let builder = Builder(store: publisher, chunking: .fastCDCv1)
+let readme = try builder.file(bytes: Array("# My model\n".utf8))
+let weights = try builder.file(bytes: [UInt8](repeating: 7, count: 3 << 20))
+let top = try builder.folder([
+    Entry(name: "README.md", target: readme),
+    Entry(name: "weights.bin", target: weights),
+])
+let root = try builder.finish(top: top)
+
+// A responder answers requests from the publisher's store.
+let peer = Responder(publisher)
+
+// Read a part of the tree and keep nothing: find one file by its name,
+// then take 16 bytes from the middle of it. Only the chunk that holds
+// those bytes is sent, and it is verified against the root.
+let remote = try Remote(peer: peer, root: root)
+if let entry = try remote.lookup("weights.bin") {
+    let middle = MemorySink()
+    try remote.read(entry.target, offset: 1 << 20, length: 16, to: middle)
+    print(middle.bytes)
+}
+
+// Or fetch the whole tree into another store. Each part is verified
+// before it is kept, and what the store already holds is skipped.
+let mirror = MemoryStore()
+let summary = try fetch(mirror, root, from: peer)
+print(summary.files, "files")
+```
+
+## Syncing Over a Connection
+
+Syncing runs over anything that reads and writes bytes: a TCP or QUIC stream, a WebSocket, a pipe. The library takes a connection as a `ByteSource` and a `ByteSink`, which a type of yours has: one reads as many bytes as are there, up to so many, and gives zero only at the end, and the other writes bytes whole or throws. One side serves and the other asks.
+
+```swift
+import ScionicMerkleTree
+
+/// The side that holds the tree. It answers one peer's requests until the
+/// peer hangs up.
+func serveOnePeer(_ store: any Store, over connection: any ByteSource & ByteSink) throws {
+    try serve(store, from: connection, to: connection)
+}
+
+/// The side that wants the tree. A fetch that was cut off goes on from what
+/// the store holds when it is run again.
+func fetchTree(_ root: Root, into store: any Store, over connection: any ByteSource & ByteSink) throws {
+    let peer = StreamPeer(input: connection, output: connection)
+    _ = try fetch(store, root, from: peer)
 }
 ```
 
-### Diffing
+The library verifies everything against the root, so a connection does not have to be trusted for the data to be right. It does not encrypt or authenticate the connection: use TLS or Noise where a transfer should be private.
+
+A sink that keeps bytes back, as a buffered one does, has a `flush` method, and the library calls it where the other side waits for what was written. `serve` reads its requests through a buffer of its own.
+
+## What Else It Does
+
+| To do this | Use |
+| --- | --- |
+| Build a tree from a folder or a file on disk | `build`, `BuildOptions` |
+| Build a tree from bytes or streams, entry by entry | `Builder` |
+| Verify a tree that a store holds, and mend damage | `verify`, `VerifyOptions` |
+| Find a path, read a file, read a range of its bytes | `lookup`, `readFile`, `readRange`, `readOpen` |
+| Write a tree out to disk | `writeToDisk`, `WriteOptions` |
+| Serve a store to peers | `serve`, `Responder` |
+| Fetch a whole tree from a peer | `fetch` |
+| Read parts of a peer's tree and keep nothing | `Remote` |
+| Carry a whole tree as one file or stream | `exportBundle`, `importBundle` |
+| List what changed between two trees | `diff`, `Change` |
+| Bring your own transport | `Intake`, `Request`, `Frame`, the `Peer` protocol |
+| Bring your own storage | the `Store` protocol |
+
+**Building.** Building uses every core unless `BuildOptions.workers` says otherwise. Several files are chunked at once, and the chunks of one long file are hashed several at once. A file is never held in memory whole: a builder holds up to 16 MiB of it, or up to 64 MiB while other threads help it. `BuildOptions.timestamp` writes the time into the tree's record, and the `entryExtra` of `build` attaches extra data to each entry, such as a file mode or a media type. A link or a special file in the folder is refused, or left out with `links: .skip`. It is never followed.
+
+**Verifying and mending.** `verify` checks every list and every chunk that a store holds for a root, on every core. When bytes were harmed where they are kept, the error says which thing it is: `ScionicError.corrupt` carries its hash. With `VerifyOptions(discardDamaged: true)` the damaged parts are removed, and the next `fetch` brings back exactly those. `VerifyOptions(rechunk: true)` also chunks every file again, and refuses a file that was not chunked the standard way.
 
 ```swift
-let diff = dagDiff(first: oldDag, second: newDag)
-print("Added: \(diff.summary.added), Removed: \(diff.summary.removed)")
-let reconstructed = try diff.applyToDAG(oldDag)
+// Verifying finds the damage, and the error names what was harmed.
+do {
+    _ = try verify(mirror, root)
+} catch ScionicError.corrupt(_, let hash) {
+    print("the damaged chunk is named:", hash == chunk)
+}
+
+// With discardDamaged the damaged parts are removed, and the next fetch
+// brings back exactly those.
+do {
+    _ = try verify(mirror, root, options: VerifyOptions(discardDamaged: true))
+} catch ScionicError.missing {
+    print("it is missing now")
+}
+_ = try fetch(mirror, root, from: Responder(publisher))
 ```
 
-### Partial DAGs
+**Bundles and changes.** A whole tree can travel as one stream, and two trees in one store can be compared. A file is read and written here through two small types over Foundation's `FileHandle`:
 
 ```swift
-let partial = try dag.getPartial(leafHashes: [someHash], pruneLinks: true)
-try partial.verify()  // Uses Merkle proofs, doesn't need full tree
+import Foundation
+import ScionicMerkleTree
+
+/// The bytes of a file, in order.
+final class FileSource: ByteSource {
+    let file: FileHandle
+
+    init(_ file: FileHandle) {
+        self.file = file
+    }
+
+    func read(into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
+        // At the end of the file there is nothing more: zero bytes.
+        guard let bytes = try file.read(upToCount: buffer.count) else {
+            return 0
+        }
+        return bytes.copyBytes(to: buffer)
+    }
+}
+
+/// Bytes written to a file, in order.
+final class FileSink: ByteSink {
+    let file: FileHandle
+
+    init(_ file: FileHandle) {
+        self.file = file
+    }
+
+    func write(_ bytes: UnsafeRawBufferPointer) throws {
+        try file.write(contentsOf: Data(bytes))
+    }
+}
+
+let store = MemoryStore()
+let older = try build(store, path: "release-1")
+let newer = try build(store, path: "release-2")
+
+// What changed, by path. The chunks that both releases share are held once.
+for change in try diff(store, old: older, new: newer) {
+    print(change.path)
+}
+
+// The new release as one file: the record, then every list and every
+// chunk once.
+try Data().write(to: URL(fileURLWithPath: "release-2.bundle"))
+let bundle = try FileHandle(forWritingTo: URL(fileURLWithPath: "release-2.bundle"))
+try exportBundle(store, newer, to: FileSink(bundle))
+try bundle.close()
+
+// Reading it back runs the same checks as a fetch from a peer.
+let reading = try FileHandle(forReadingFrom: URL(fileURLWithPath: "release-2.bundle"))
+let elsewhere = MemoryStore()
+let summary = try importBundle(elsewhere, newer, from: FileSource(reading))
+try reading.close()
+print(summary.files, "files arrived")
 ```
 
-### DagStore (persistent storage)
+**Every example in this file is run by the tests,** from the files in [`tests/Examples`](tests/Examples).
+
+**Three programs come with the package.** [`examples/roundtrip`](examples/roundtrip) takes a folder the whole way round with a store on disk: it builds the tree, verifies it, fetches it into a second store, reads a range from the middle of its largest file, writes it out again, and holds the copy to the same root, timing each step. [`examples/speed`](examples/speed) measures chunking, hashing, building and verifying into a store in memory, and builds a folder of your own when it is given one. [`examples/proofsizes`](examples/proofsizes) prints the branch sizes in the tables above.
+
+```sh
+swift run -c release roundtrip <folder> <work-dir>
+swift run -c release speed <MiB> [folder]
+swift run -c release proofsizes
+```
+
+## Stores
+
+A store keeps bytes under hashes, and that is all the library asks of one. `MemoryStore` is a store in memory, for tests and small trees. A database, a folder on disk or an object store conforms to the `Store` protocol:
 
 ```swift
-let store = DagStore(dag)
-try store.verify()
-let content = try store.getContentFromLeaf(fileHash)
+public protocol Store: AnyObject, Sendable {
+    /// Keeps `bytes` under `hash`. Keeping what is kept already changes nothing.
+    /// The bytes are lent for the call only: a store that keeps them keeps a
+    /// copy.
+    func put(_ kind: Stored, _ hash: Hash, _ bytes: UnsafeRawBufferPointer) throws
 
-// Custom backends
-let store = DagStore(root: hash, leafStore: myDB, contentStore: myFileStore)
+    /// What is kept under `hash`, if anything.
+    func get(_ kind: Stored, _ hash: Hash) throws -> [UInt8]?
+
+    /// Whether anything is kept under `hash`. Unless a store has its own, this
+    /// asks how long the thing is, so a store that can say that without reading
+    /// the bytes is not read.
+    func has(_ kind: Stored, _ hash: Hash) throws -> Bool
+
+    /// How many bytes are kept under `hash`.
+    func size(_ kind: Stored, _ hash: Hash) throws -> UInt64?
+
+    /// Forgets what is kept under `hash`.
+    func remove(_ kind: Stored, _ hash: Hash) throws
+}
 ```
 
-### Parallel creation
+`Stored` says which of four kinds of thing it is: a chunk, a file's chunk list, a folder's listing, or a tree's record. A store never has to understand what it holds: every byte it hands back is checked again before it is used.
 
-```swift
-let config = DagBuilderConfig(enableParallel: true, maxWorkers: 4)
-let dag = try createDagWithConfig(path: "/large/directory", config: config)
+A store need not have `has` or `size` of its own: unless it has, `size` reads the whole thing. A store that can answer without reading the bytes should have them, and a store on disk should have `size` at the least: without it, seeing whether a chunk is there takes a read of the whole chunk. [`examples/roundtrip`](examples/roundtrip) has a complete store that keeps each thing as a file named by its hash.
+
+## Errors
+
+Every error the library throws is a `ScionicError`, unless a store, a source or a sink of yours threw it. What went wrong is told by its case, such as `.corrupt`, `.missing`, `.hashMismatch`, `.limitExceeded` or `.invalidData`, and a case's values say more where they apply, as the hash does for a damaged chunk above. An error from a store of yours is handed back as it is, and one from a source or a sink of yours inside `.stream`, which says what was being read or written.
+
+A source that fails is never taken for one that ended. A file whose source breaks off, or a stream that fails with its last bytes, is an error, and not a shorter file. A source that says it gave more bytes than it was asked for is an error too.
+
+## Words Used in the API
+
+The API and the specification use the same words as this page. This is where each one is found:
+
+| Here | In the API and in `spec/FORMAT.md` |
+| --- | --- |
+| chunk | `ChunkRef`, `Stored.chunk` |
+| a file's chunk list | file list: `FileList` |
+| a folder's listing | folder list: `FolderList`, made of entries: `Entry` |
+| Merkle branch, Merkle proof | branch: `FileBranch`, `FolderBranch` |
+| chunking | `Chunking`, `Chunking.fastCDCv1` |
+| root | `Root`, the hash of the tree's record: `Record` |
+
+| File in `src/` | What it holds |
+| --- | --- |
+| `Format.swift` | The bytes of a chunk, a file, a folder, an entry and the record, and the branches that show a part of a list. Reading is strict. |
+| `Tree.swift` | The Classic Merkle Tree of a list: building it, showing a part of it, and checking a part. |
+| `FastCDC.swift` | Content-defined chunking (`fastcdc-v1`), in memory and as a stream. |
+| `Build.swift` | Building a tree from a folder on disk or from bytes. |
+| `Intake.swift` | The one set of checks for a tree that comes from a peer, comes in a bundle, or sits in a store. |
+| `Read.swift` | Finding a path, reading a file or a range of one, and writing a tree out to disk. |
+| `Diff.swift` | What changed between two trees. |
+| `Wire.swift` | The requests, and the frames that answer them. |
+| `Sync.swift` | Serving a store, fetching a tree, reading parts of a peer's tree, and bundles. |
+| `Store.swift` | The `Store` protocol, and a store in memory. |
+| `Disk.swift` | Holding a folder open, so that nothing below it is reached through a link. |
+| `SHA256.swift` | SHA-256: CryptoKit on Apple's systems, CNG on Windows, and `swift-crypto` elsewhere. |
+
+## Performance
+
+Measured on a Windows 11 laptop with Swift 6.3.1, built with `-c release`. The two programs named in the tables print the same figures on any machine.
+
+| Into a store in memory (`examples/speed`) | |
+| --- | ---: |
+| Content-defined chunking, one core | 6.9 GiB/s |
+| SHA-256 of the chunks, one core | 4.0 GiB/s |
+| Building a tree from one file of 1 GiB, every core | 5.1 GiB/s |
+| Building a tree from ten files of 256 MiB on disk, every core | 8.0 GiB/s |
+| Building a tree from 20,000 files of 4 KiB on disk, every core | 0.18 s |
+| Verifying every byte of a tree of 1 GiB, every core | 66 GiB/s |
+
+| With a store on disk, a folder of 3.5 GiB (`examples/roundtrip`) | |
+| --- | ---: |
+| Building the tree into the store | 2.1 s |
+| Verifying every byte from the store | 0.4 s |
+| Fetching the tree into a second store | 6.7 s |
+| Reading 4 KiB from the middle of a file of 1.5 GiB, through a peer | 4 ms |
+| Writing the tree back out as files | 6.6 s |
+
+That folder holds one file of 1 GiB twice. The tree stores it once: 3.5 GiB of files are kept as 2.5 GiB of chunks and 40 KB of lists.
+
+## Security
+
+A receiver trusts one thing: the root. The peer that sends a tree, the network in between, and the bytes that sit in a store are all treated as untrusted. The tests hold the library to the guarantees below with forged bytes ([`tests/ForgeryTests.swift`](tests/ForgeryTests.swift)), which are made by a second, independent copy of the format's rules ([`tests/Support/Oracle.swift`](tests/Support/Oracle.swift)).
+
+**What is verified**
+
+- **No forged content.** A made-up child under a folder or a file, a real child's branch offered with another child, a file offered as a folder, a list offered as a chunk, and a file given another file's chunks are all refused.
+- **No short files.** A file never comes back shorter than it is. If a chunk is missing, reading is an error.
+- **One name, one place.** A folder cannot show one name at two places, even if it was put together out of order on purpose.
+- **Every byte of a branch counts.** A branch that differs in any one byte is refused, so no two branches prove the same thing.
+- **Nothing is kept before it is verified.** A frame that nothing asked for is refused and not kept. A list that fails a check is not kept either, and that transfer takes nothing more.
+
+**What is bounded**
+
+- **Memory.** A peer cannot make a receiver set aside more memory than the tree it trusts calls for: every request says how long its answer may be.
+- **Size.** A tree's record says how much the tree holds, and taking it in stops as soon as it would hold more.
+- **Expansion.** A small tree that stands for an endless one, by holding one folder under many names, is counted before it is written out, and refused.
+- **Malformed input** is an error, and never a crash or a loop.
+- **Waiting.** A build or a check whose store fails on one of its threads ends with that error, and no thread waits for another that has stopped.
+
+**What a store can count on**
+
+- **Damage is found and named.** Bytes that were harmed in a store are found when the tree is verified, and named by their hash. They can be removed and fetched again on their own.
+- **A peer cannot delete your data.** Nothing a peer sends makes a store remove bytes that are sound. A list that names a held chunk with a wrong length is refused, and the chunk stays.
+
+**What happens on disk**
+
+- **A link is never followed when a tree is built.** That holds for a link that is in the folder, and for one that takes a file's or a folder's place while the folder is being read. Each folder is held open while it is read, and what is in it is opened from the folder itself, never by a path that is looked up again.
+- **Nothing is written outside the destination.** A tree is written only to a new place, and only with names the system can hold as they are. The new folders are held open while they are filled, so a link that takes the place of one is not written through.
+- **A file is read under its own name.** Windows drops a dot or a space from the end of a name when it looks a path up, and takes `NUL` for a device wherever it stands, so a file `model.` beside a file `model` would be read as `model`. Everything below the folder a caller names is opened by a path that Windows takes letter for letter.
+- **Whatever is held open is let go of,** however the work ends: as it should, or with an error of its own or of a store, a source or a sink of yours.
+
+The exact rules are in [`spec/FORMAT.md`](spec/FORMAT.md), under "What a receiver checks", "Limits", "Building a tree" and "Writing a tree out".
+
+## Known Limitations
+
+- **One file is chunked on one core,** because where a chunk ends decides where the next begins. That is about 7 GiB a second on the machine above. Hashing the chunks, which is the greater part of the work, uses every core.
+- **Fetching a tree and writing a tree out use one core each.** On the disks they were tried on, the disk was the slower part.
+- **Verifying or fetching a whole tree keeps a small record in memory for every different chunk,** so that each chunk is counted once: some tens of megabytes for a terabyte.
+- **A list is taken in whole.** A file's chunk list is 36 bytes a chunk, about 18 MB for each terabyte of the file, and a folder's listing has to fit in memory.
+- **A tree is built from a folder as the folder is while it is read.** If another program changes files in it meanwhile, the tree can hold a mix of old and new. It cannot be led outside the folder.
+- **Links, special files and file permissions are not stored.** An entry's extra data has room for a caller to record a mode.
+- **A responder that tells a peer which chunks of a file it holds looks into its store for each of them.** `Responder(store, have: false)` switches that off for one that serves strangers.
+- **A connection has to hold 2,048 bytes of requests on their way,** which every connection over a network does. Between a `StreamPeer` and `serve`, a connection that holds nothing works all the same, and for an answerer of another make there is `StreamPeer(input:output:ahead: 0)`.
+- **On Windows, opening a file so that it cannot be led astray costs more than a plain open.** With every core at work it does not show. While a folder is being read on Windows, other programs cannot rename or delete it.
+
+## Specification and Test Vectors
+
+- [`spec/FORMAT.md`](spec/FORMAT.md) is the format: what every hash covers, what a receiver checks, the bytes of every request and answer, and the limits.
+- [`spec/vectors/manifest.json`](spec/vectors/manifest.json) holds the shared vectors, which the Rust library makes and every implementation is held to, byte for byte: 7 whole trees with every one of their bytes, 9 branches of them, 8 lookups of a name, 12 requests with their answers, 3 exchanges on a connection, and 76 forged inputs that must be refused. [`spec/vectors/README.md`](spec/vectors/README.md) says how a library reads the file.
+- [`spec/fastcdc-vectors/manifest.json`](spec/fastcdc-vectors/manifest.json) pins where 11 files are chunked, and what each file hashes to.
+
+The files under `spec/` are the Rust library's, copied byte for byte. The tests check the vectors' own hash before they use them.
+
+## Other Implementations
+
+| Implementation | Version | |
+| --- | --- | --- |
+| Swift, this repository | 2.5.6 | |
+| [Rust](https://github.com/HORNET-Storage/Scionic-MerkleTree-Rust) | 2.5.6 | The reference for the format. |
+| [Go](https://github.com/HORNET-Storage/Scionic-Merkle-Tree) | 2.5.6 | |
+
+The three libraries are kept in step: one format, one set of vectors and one version number. A tree built by the Rust or the Go library and one built by this library from the same folder have the same root, and each reads what the others write.
+
+## Development
+
+```sh
+swift build --build-tests
+swift test
+swift test -c release -Xswiftc -enable-testing
 ```
 
-## Architecture
+CI runs these on Linux, macOS and Windows on every push, runs the tests once more on Swift 6.0, the oldest version the package supports, and builds the library for iOS. The tests also hold this file to the package: its Swift code is taken from files that are compiled and run, and its tables of branch sizes from the program that measures them.
 
-```
-src/
-├── dag/                  — Scionic DAG types, leaves, creation, fastcdc-v1 + legacy chunking, verification, serialization, transmission, store
-├── diff/                 — DAG diffing and patching
-├── internal/             — CBOR, CID, SHA-256 backend, Base encodings, Varint
-├── classic-merkle-tree/  — Classic Merkle Tree proof generation/verification
-├── classic-tree-wrapper/ — Key/value wrapper around Classic Merkle Trees
-├── testutil/             — Fixture builders used by parity tests
-└── ScionicMerkleTree.swift
-
-tests/
-├── diff/                 — DAG diff/apply tests
-├── classic-tree-wrapper/ — Go tree wrapper parity tests
-├── tests/                — Go-style integration, DAG, partial, store, store-index, streaming, transmission, fixture, cross-compat, and fastcdc unit + conformance tests
-├── AuditTests.swift      — clone, serialization, store, transmission, diff, partial flows
-├── AuditSecurityTests.swift — path-traversal rejection, streaming tamper detection, forged-child detection
-├── FixtureTests.swift    — standard fixture coverage across DAG operations
-├── MerkleTreeTests.swift — classic Merkle Tree build/verify/proof behavior, including parallel/sequential parity
-├── TreeContentTests.swift — Classic tree wrapper parity for build and verify helpers
-├── CBORTests.swift       — CBOR encoding/decoding determinism
-├── CIDTests.swift        — varint, base32, base58, CID generation
-└── ScionicMerkleTreeTests.swift — package smoke test
-
-spec/
-├── vectors/          — shared spec-vector corpus, byte-identical across the Go, Rust and Swift repos
-└── fastcdc-vectors/  — fastcdc-v1 conformance manifest (boundaries, chunk digests, reuse partitions, DAG roots)
-```
-
-## Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| [swift-crypto](https://github.com/apple/swift-crypto) | SHA-256 hashing on Apple platforms (a CryptoKit re-export there) and Linux; Windows builds hash through the OS's CNG/BCrypt via `src/internal/SHA256Backend.swift` instead |
-
-**That’s it.** CBOR, CID, multihash, multibase, base58, base32, Merkle trees — all implemented directly in Swift.
-
-## What Remains
-
-Remaining work is ongoing hardening rather than known missing core behavior:
-
-| Item | Priority | Description |
-|------|----------|-------------|
-| Broader Go parity sweep | Low | Continue adding edge-case vectors as the Go implementation evolves |
-| Backend-specific integration tests | Low | Exercise custom persistent LeafStore/ContentStore implementations beyond the in-memory stores |
-
-## How Compatibility Works
-
-The Go library hashes leaves by:
-1. CBOR-serializing a struct with fields in **exact Go declaration order** (PascalCase keys)
-2. Hashing the CBOR bytes with **SHA-256**
-3. Wrapping in a **CIDv1** with CBOR codec (`0x51`) and SHA2-256 multihash (`0x12`)
-4. Encoding as **base32lower** with `b` prefix
-
-The Swift library reproduces this pipeline byte-for-byte:
-- `CBOREncoder` matches `fxamacker/cbor` v2 default encoding
-- `CID.generate(from:)` matches `cid.Prefix{Version: 1, Codec: mc.Cbor, MhType: mh.SHA2_256}.Sum()`
-- `Base32Lower.encode()` matches `go-multibase` base32lower (no padding)
-- `MerkleTree.build()` matches the modified `go-merkletree`
-
-**The same directory produces the same root hash in both Go and Swift.**
+The three pictures of this file are the Go library's, byte for byte: [`docs/pictures/README.md`](docs/pictures/README.md) says where they are drawn.
 
 ## License
 
-MIT
+Released under the MIT License.

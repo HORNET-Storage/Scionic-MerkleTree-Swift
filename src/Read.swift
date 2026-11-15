@@ -69,11 +69,15 @@ public func lookup(_ store: any Store, _ root: Root, path: String) throws -> Ent
     return found
 }
 
-/// Bytes written to memory.
-final class MemorySink: ByteSink {
-    var bytes: [UInt8] = []
+/// Bytes written to memory: a stretch of a file, or a tree as one stream, that
+/// is to be held in memory.
+public final class MemorySink: ByteSink {
+    /// What was written, in order.
+    public var bytes: [UInt8] = []
 
-    func write(_ more: UnsafeRawBufferPointer) throws {
+    public init() {}
+
+    public func write(_ more: UnsafeRawBufferPointer) throws {
         bytes.append(contentsOf: more)
     }
 }

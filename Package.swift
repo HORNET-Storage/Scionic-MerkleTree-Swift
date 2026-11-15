@@ -29,9 +29,14 @@ let package = Package(
             ],
             path: "src"
         ),
+        // Three programs that use the library as any program would. The README
+        // says how to run them, and the tests run what is in them.
+        .executableTarget(name: "proofsizes", dependencies: ["ScionicMerkleTree"], path: "examples/proofsizes"),
+        .executableTarget(name: "roundtrip", dependencies: ["ScionicMerkleTree"], path: "examples/roundtrip"),
+        .executableTarget(name: "speed", dependencies: ["ScionicMerkleTree"], path: "examples/speed"),
         .testTarget(
             name: "ScionicMerkleTreeTests",
-            dependencies: ["ScionicMerkleTree"],
+            dependencies: ["ScionicMerkleTree", "proofsizes", "roundtrip", "speed"],
             path: "tests"
         ),
     ]

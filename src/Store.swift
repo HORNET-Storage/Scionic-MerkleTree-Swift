@@ -32,6 +32,8 @@ public enum Stored: UInt8, Hashable, Sendable, Comparable, CaseIterable {
 /// there takes a read of the whole chunk.
 public protocol Store: AnyObject, Sendable {
     /// Keeps `bytes` under `hash`. Keeping what is kept already changes nothing.
+    /// The bytes are lent for the call only: a store that keeps them keeps a
+    /// copy.
     func put(_ kind: Stored, _ hash: Hash, _ bytes: UnsafeRawBufferPointer) throws
 
     /// What is kept under `hash`, if anything.
