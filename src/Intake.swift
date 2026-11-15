@@ -21,6 +21,45 @@ import Dispatch
 /// The most chunks one request asks for.
 private let chunksPerRequest: UInt32 = 64
 
+/// How many chunks one thread looks for in a store before another thread
+/// helps. A store on disk looks at a file for each, which takes tens of
+/// microseconds, and handing work to another thread takes about one.
+private let looksByEach = 64
+
+/// Whether `store` holds the chunk that `item` names. The chunk's bytes are
+/// counted here, not hashed. What it holds under the hash and is not what the
+/// hash says is damaged, as `damaged(in:discard:_:_:_:)` says.
+private func storeHolds(_ store: any Store, _ item: ChunkRef, discard: Bool) throws -> Bool {
+    guard let size = try store.size(.chunk, item.hash) else {
+        return false
+    }
+    if size == UInt64(item.length) {
+        return true
+    }
+    // Either the store's bytes are damaged, or the list gives the chunk a
+    // length it does not have. Only damaged bytes are ever removed: a list
+    // that names a sound chunk wrongly must not cost the store it.
+    guard let bytes = try store.get(.chunk, item.hash) else {
+        return false
+    }
+    if Hash.of(bytes) == item.hash {
+        throw ScionicError.sizeMismatch(what: "a held chunk", expected: UInt64(item.length), actual: size)
+    }
+    try damaged(in: store, discard: discard, .chunk, item.hash, "a stored chunk")
+    return false
+}
+
+/// The store holds, under `hash`, bytes that are not what the hash says. They
+/// are removed when `discard` allows it, so that they are wanted again.
+/// Otherwise they are an error that names them.
+private func damaged(in store: any Store, discard: Bool, _ kind: Stored, _ hash: Hash, _ what: String) throws {
+    if discard {
+        try store.remove(kind, hash)
+    } else {
+        throw ScionicError.corrupt(what: what, hash: hash)
+    }
+}
+
 /// What a frame turned out to be, once its hash was worked out.
 public enum Arrived: Hashable, Sendable {
     case record
@@ -57,7 +96,8 @@ public struct VerifyOptions: Hashable, Sendable {
     /// this the check stops at a damaged thing and names it, and the store is
     /// left as it is.
     public var discardDamaged: Bool
-    /// How many chunks are hashed at once. Zero is one for each core.
+    /// How many threads check the tree at once: they hash its chunks, and look
+    /// in the store for the chunks of a long list. Zero is one for each core.
     public var workers: Int
 
     public init(rechunk: Bool = false, discardDamaged: Bool = false, workers: Int = 0) {
@@ -72,6 +112,9 @@ struct Mode {
     var rechunk = false
     /// Remove from the store what is damaged there, and want it again.
     var discard = false
+    /// How many threads look in the store at once for the chunks of a list.
+    /// Zero is one for each core.
+    var threads = 0
 }
 
 private struct FolderSlot {
@@ -188,9 +231,10 @@ public final class Intake {
     /// no record yet, and counts what its record has to say: each different
     /// chunk and each different list, once. The store must hold every list.
     /// This is how a builder comes by a record's totals, so a tree that is built
-    /// has passed the checks of a tree that is taken in.
-    static func measure(_ store: any Store, top: Target, chunking: Chunking) throws -> Totals {
-        let intake = Intake(bare: store, root: Root(hash: .zero), mode: Mode())
+    /// has passed the checks of a tree that is taken in. Up to `threads` threads
+    /// look in the store at once.
+    static func measure(_ store: any Store, top: Target, chunking: Chunking, threads: Int) throws -> Totals {
+        let intake = Intake(bare: store, root: Root(hash: .zero), mode: Mode(threads: threads))
         intake.measuring = chunking
         try intake.refer(top)
         try intake.drain()
@@ -292,33 +336,28 @@ public final class Intake {
     /// They are removed when this intake may do that, so that they are wanted
     /// again. Otherwise they are an error that names them.
     private func damaged(_ kind: Stored, _ hash: Hash, _ what: String) throws {
-        if mode.discard {
-            try store.remove(kind, hash)
-        } else {
-            throw ScionicError.corrupt(what: what, hash: hash)
-        }
+        try ScionicMerkleTree.damaged(in: store, discard: mode.discard, kind, hash, what)
     }
 
-    /// Whether the store holds the chunk that `item` names. The chunk's bytes
-    /// are counted here, not hashed.
-    private func holds(_ item: ChunkRef) throws -> Bool {
-        guard let size = try store.size(.chunk, item.hash) else {
-            return false
+    /// Whether the store holds the chunk of each of `items`, in their order:
+    /// asked on several threads at once where there are enough of them to share.
+    private func heldOf(_ items: [ChunkRef]) -> [Result<Bool, any Error>] {
+        let store = self.store
+        let discard = mode.discard
+        let threads = mode.threads == 0 ? processorCount() : mode.threads
+        let workers = max(1, min(items.count / looksByEach, threads))
+        if workers == 1 {
+            return items.map { item in Result { try storeHolds(store, item, discard: discard) } }
         }
-        if size == UInt64(item.length) {
-            return true
+        let found = Shared([Result<Bool, any Error>](repeating: .success(false), count: items.count))
+        let dealer = Dealer(count: items.count)
+        onWorkers(workers) { _ in
+            while let index = dealer.take() {
+                let held = Result { try storeHolds(store, items[index], discard: discard) }
+                found.with { $0[index] = held }
+            }
         }
-        // Either the store's bytes are damaged, or the list gives the chunk a
-        // length it does not have. Only damaged bytes are ever removed: a list
-        // that names a sound chunk wrongly must not cost the store it.
-        guard let bytes = try store.get(.chunk, item.hash) else {
-            return false
-        }
-        if Hash.of(bytes) == item.hash {
-            throw ScionicError.sizeMismatch(what: "a held chunk", expected: UInt64(item.length), actual: size)
-        }
-        try damaged(.chunk, item.hash, "a stored chunk")
-        return false
+        return found.with { $0 }
     }
 
     /// Notes that a checked parent names `target`.
@@ -454,23 +493,48 @@ public final class Intake {
         let order = slot.order
         wantedLists.remove(order)
         try countListBytes(list.encodedCount)
+        // The chunks that this list names for the first time are counted in
+        // their order, up to the first that is wrong.
+        var first: [Hash: UInt32] = [:]
+        var fresh: [(number: Int, item: ChunkRef)] = []
+        var wrong: (any Error)?
         for (number, item) in list.items.enumerated() {
-            if let known = chunks[item.hash] {
-                guard known.length == item.length else {
-                    throw ScionicError.sizeMismatch(
+            if let length = chunks[item.hash]?.length ?? first[item.hash] {
+                guard length == item.length else {
+                    wrong = ScionicError.sizeMismatch(
                         what: "a chunk that is listed with two lengths",
-                        expected: UInt64(known.length),
+                        expected: UInt64(length),
                         actual: UInt64(item.length)
                     )
+                    break
                 }
                 continue
             }
-            try countChunk(item.length)
-            let wantedAt = try holds(item) ? nil : Place(order: order, number: UInt64(number))
+            do {
+                try countChunk(item.length)
+            } catch {
+                wrong = error
+                break
+            }
+            first[item.hash] = item.length
+            fresh.append((number, item))
+        }
+        // Whether the store holds each of them is asked on several threads at
+        // once: a store on disk looks at a file for each, and a list can name a
+        // great many. Only the chunks before the first that is wrong are asked
+        // about, and the answers are taken in their order, so the error is that
+        // of the first chunk that is wrong, as it would be if each were asked
+        // about in turn.
+        let held = heldOf(fresh.map(\.item))
+        for (place, (number, item)) in fresh.enumerated() {
+            let wantedAt = try held[place].get() ? nil : Place(order: order, number: UInt64(number))
             if let wantedAt {
                 wantedChunks.insert(wantedAt, item.hash)
             }
             chunks[item.hash] = ChunkSlot(length: item.length, wantedAt: wantedAt)
+        }
+        if let wrong {
+            throw wrong
         }
         if mode.rechunk && chunking == .fastCDCv1 {
             toRechunk.append(list.hash)
@@ -1173,7 +1237,8 @@ final class TakingIn {
 /// The lists are checked first. Then every chunk is hashed again, several at
 /// once, and last, when that is asked for, every file is chunked again.
 public func verify(_ store: any Store, _ root: Root, options: VerifyOptions = VerifyOptions()) throws -> Summary {
-    let intake = try Intake(store: store, root: root, mode: Mode(rechunk: options.rechunk, discard: options.discardDamaged))
+    let mode = Mode(rechunk: options.rechunk, discard: options.discardDamaged, threads: options.workers)
+    let intake = try Intake(store: store, root: root, mode: mode)
     try intake.rehashHeld(workers: options.workers)
     try intake.rechunkHeld()
     return try intake.finish()

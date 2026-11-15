@@ -121,7 +121,8 @@ public final class Builder {
     /// where its chunks end, and hash and keep them; for a file that is read,
     /// while the calling thread reads on. With help, a builder holds up to
     /// 64 MiB of a long file that it reads at a time; alone it holds up to
-    /// 16 MiB.
+    /// 16 MiB. When the tree is finished, they look in the store for the chunks
+    /// of its long lists.
     public init(store: any Store, chunking: Chunking = .fastCDCv1, threads: Int = 0) {
         self.store = store
         self.chunking = chunking
@@ -239,7 +240,11 @@ public final class Builder {
     /// a tree goes through when it is taken in, and the totals in the record
     /// are what those checks counted.
     public func finish(top: Target, extra: ExtraData = ExtraData()) throws -> Root {
-        let totals = try Intake.measure(store, top: top, chunking: chunking)
+        // The tree is measured with this builder's threads: the helpers that are
+        // free look in the store for the chunks of a long list.
+        let helping = helpers.take(Int.max)
+        defer { helpers.give(helping) }
+        let totals = try Intake.measure(store, top: top, chunking: chunking, threads: helping + 1)
         let record = try Record(top: top, totals: totals, chunking: chunking, extra: extra)
         let bytes = record.encode()
         let root = Root.of(record: bytes)

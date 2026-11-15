@@ -2,6 +2,7 @@
 // checks. And a build that fails, or whose store falls over, ends: it is told
 // as it happened, nobody is left waiting, and no folder is left held open.
 
+import Foundation
 import XCTest
 @testable import ScionicMerkleTree
 
@@ -156,6 +157,96 @@ private func longBytes(_ seed: UInt64, _ length: Int) -> [UInt8] {
     }
     out.removeLast(out.count - length)
     return out
+}
+
+/// A store that takes a while to look for a thing, as one on disk does, and
+/// cannot tell whether it holds the things it is told of.
+private final class Slow: Store, @unchecked Sendable {
+    let inner: MemoryStore
+    private let unsure: [Hash: String]
+
+    init(_ inner: MemoryStore, unsure: [Hash: String] = [:]) {
+        self.inner = inner
+        self.unsure = unsure
+    }
+
+    func put(_ kind: Stored, _ hash: Hash, _ bytes: UnsafeRawBufferPointer) throws {
+        try inner.put(kind, hash, bytes)
+    }
+
+    func get(_ kind: Stored, _ hash: Hash) throws -> [UInt8]? {
+        try inner.get(kind, hash)
+    }
+
+    func remove(_ kind: Stored, _ hash: Hash) throws {
+        try inner.remove(kind, hash)
+    }
+
+    func size(_ kind: Stored, _ hash: Hash) throws -> UInt64? {
+        let started = DispatchTime.now().uptimeNanoseconds
+        while DispatchTime.now().uptimeNanoseconds - started < 20_000 {}
+        if let detail = unsure[hash] {
+            throw ScionicError.invariant(detail)
+        }
+        return try inner.size(kind, hash)
+    }
+}
+
+/// A tree of one file of a thousand short chunks, enough that whether a store
+/// holds each is asked on several threads at once, and its chunks.
+private func manyChunks(_ seed: UInt64) throws -> (store: MemoryStore, root: Root, chunks: [[UInt8]]) {
+    let data = longBytes(seed, 16 * 1000)
+    let store = MemoryStore()
+    let builder = Builder(store: store, chunking: smallChunks())
+    let root = try builder.finish(top: builder.file(bytes: data))
+    let chunks = stride(from: 0, to: data.count, by: 16).map { Array(data[$0..<min($0 + 16, data.count)]) }
+    return (store, root, chunks)
+}
+
+/// A store that holds what `source` holds, but for its chunks.
+private func listsOf(_ source: MemoryStore) throws -> MemoryStore {
+    let store = MemoryStore()
+    for kind in Stored.allCases where kind != .chunk {
+        for hash in source.hashes(kind) {
+            try store.put(kind, hash, try XCTUnwrap(source.get(kind, hash)))
+        }
+    }
+    return store
+}
+
+/// A store that notes every thread that asks it anything.
+private final class Watched: Store, @unchecked Sendable {
+    let inner = MemoryStore()
+    private let seen = Shared<Set<ObjectIdentifier>>([])
+
+    var threads: Set<ObjectIdentifier> {
+        seen.with { $0 }
+    }
+
+    private func note() {
+        let thread = ObjectIdentifier(Thread.current)
+        seen.with { _ = $0.insert(thread) }
+    }
+
+    func put(_ kind: Stored, _ hash: Hash, _ bytes: UnsafeRawBufferPointer) throws {
+        note()
+        try inner.put(kind, hash, bytes)
+    }
+
+    func get(_ kind: Stored, _ hash: Hash) throws -> [UInt8]? {
+        note()
+        return try inner.get(kind, hash)
+    }
+
+    func remove(_ kind: Stored, _ hash: Hash) throws {
+        note()
+        try inner.remove(kind, hash)
+    }
+
+    func size(_ kind: Stored, _ hash: Hash) throws -> UInt64? {
+        note()
+        return try inner.size(kind, hash)
+    }
 }
 
 struct DiskWentAway: Error {}
@@ -449,6 +540,48 @@ final class ThreadsTests: XCTestCase {
         let store = MemoryStore()
         try importBundle(store, root, from: BytesSource(bundleOf(twice)))
         XCTAssertEqual(try contents(store), try contents(source))
+    }
+
+    func testWhatAStoreHoldsOfALongListIsFoundAsOneThreadFindsIt() throws {
+        let (source, root, chunks) = try manyChunks(11)
+        // The store holds the record, the list and two chunks in three, and one
+        // of those it holds cut short: damaged.
+        let store = Slow(try listsOf(source))
+        var lacking = 0
+        for (number, chunk) in chunks.enumerated() {
+            if number % 3 == 0 {
+                lacking += 1
+            } else if number == 500 {
+                try store.inner.put(.chunk, Hash.of(chunk), Array(chunk.dropFirst()))
+            } else {
+                try store.inner.put(.chunk, Hash.of(chunk), chunk)
+            }
+        }
+        let intake = try Intake(store: store, root: root)
+        XCTAssertEqual(intake.outstanding, lacking + 1)
+        // What it wants is what it lacks: once that is fetched, the tree is whole.
+        try fetch(store, root, from: TestPeer(source))
+        XCTAssertEqual(try contents(store.inner), try contents(source))
+    }
+
+    func testTheFailureToldOfALongListIsThatOfItsFirstChunkThatFails() throws {
+        let (source, root, chunks) = try manyChunks(13)
+        let store = Slow(try listsOf(source), unsure: [
+            Hash.of(chunks[900]): "the second chunk it cannot tell of",
+            Hash.of(chunks[100]): "the first chunk it cannot tell of",
+        ])
+        if case let .invariant(detail)? = assertFails(try Intake(store: store, root: root), "invariant") {
+            XCTAssertEqual(detail, "the first chunk it cannot tell of")
+        }
+    }
+
+    func testABuildAndACheckAskedForOneThreadUseOneThread() throws {
+        // A long list, whose chunks would be looked for on several threads.
+        let store = Watched()
+        let builder = Builder(store: store, chunking: smallChunks(), threads: 1)
+        let root = try builder.finish(top: builder.file(bytes: longBytes(19, 16 * 1000)))
+        _ = try verify(store, root, options: VerifyOptions(workers: 1))
+        XCTAssertEqual(store.threads, [ObjectIdentifier(Thread.current)])
     }
 
     func testAChunkRefusedAmongOthersIsWhatIsToldAndNothingFalseIsKept() throws {
