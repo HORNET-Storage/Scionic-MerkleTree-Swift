@@ -303,8 +303,15 @@ func fastCDCLengths(_ data: UnsafeRawBufferPointer, ended: Bool, threads: Int) -
     return lengths
 }
 
+/// How many stretches of a file there are for each thread that looks through it
+/// for matches. The threads take them one at a time, so a thread that runs
+/// slower than the others, on a slower core or on one that it shares, takes
+/// fewer, and the others do not wait for it. Where chunks end does not depend
+/// on it.
+private let stretchesForEach = 8
+
 /// Every match in `data` from `firstWholeHash` on, in order, found by
-/// `threads` threads, each in a stretch of its own.
+/// `threads` threads, which take its stretches one at a time.
 func matchesOnThreads(_ data: UnsafeRawBufferPointer, _ threads: Int) -> [Match] {
     let count = data.count
     guard count > firstWholeHash, let base = data.baseAddress else {
@@ -312,14 +319,18 @@ func matchesOnThreads(_ data: UnsafeRawBufferPointer, _ threads: Int) -> [Match]
     }
     let length = count - firstWholeHash
     let workers = max(threads, 1)
-    let each = max((length + workers - 1) / workers, 1)
+    let parts = workers * stretchesForEach
+    let each = max((length + parts - 1) / parts, 1)
     let stretches = (length + each - 1) / each
     let bytes = Unchecked(base.assumingMemoryBound(to: UInt8.self))
     let found = Shared([[Match]](repeating: [], count: stretches))
-    onWorkers(stretches) { stretch in
-        let from = firstWholeHash + stretch * each
-        let matches = findMatches(bytes.value, from: from, to: min(from + each, count))
-        found.with { $0[stretch] = matches }
+    let dealer = Dealer(count: stretches)
+    onWorkers(min(workers, stretches)) { _ in
+        while let stretch = dealer.take() {
+            let from = firstWholeHash + stretch * each
+            let matches = findMatches(bytes.value, from: from, to: min(from + each, count))
+            found.with { $0[stretch] = matches }
+        }
     }
     return Array(found.with { $0 }.joined())
 }
