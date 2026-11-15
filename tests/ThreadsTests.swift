@@ -879,12 +879,20 @@ final class ThreadsTests: XCTestCase {
         let long = [UInt8](repeating: FrameTag.chunk, count: (1 << 20) + 1)
         let short: [UInt8] = [FrameTag.chunk, 1]
         let places = 128
-        // Room for a batch and the frame that ends it, give or take what the
-        // system rounds memory up to.
+        // Room for a batch and the frame that ends it, and what the system adds
+        // to it, which an array counts as room too. Linux and Windows add a
+        // little. macOS hands over a block it has free when that block is less
+        // than twice as large as what is asked for (libmalloc: "limit
+        // fragmentation to 50%"), and gave 30.5 MiB for these 24 MiB.
+        #if canImport(Darwin)
+        let most = 2 * ChunkFrames.room + (64 << 10)
+        #else
         let most = ChunkFrames.room + (64 << 10)
+        #endif
         XCTAssertGreaterThan(places << 20, most)
         // Held as a fetch holds them.
         let held = ChunkFrames()
+        var first = 0
         for place in 0..<places {
             for _ in 0..<place {
                 short.withUnsafeBytes { held.holdCopy($0, nil) }
@@ -893,7 +901,12 @@ final class ThreadsTests: XCTestCase {
             // The intake has no record and takes no chunk, and the batch is
             // let go all the same.
             XCTAssertThrowsError(try held.takeIn(intake))
+            if place == 0 {
+                first = held.memoryHeld
+            }
         }
+        // The memory taken for the first batch served every batch after it.
+        XCTAssertEqual(held.memoryHeld, first)
         XCTAssertLessThanOrEqual(held.memoryHeld, most)
         // Read as an import reads them.
         let read = ChunkFrames()
@@ -910,7 +923,11 @@ final class ThreadsTests: XCTestCase {
             }
             XCTAssertEqual(read.count, place + 1)
             XCTAssertThrowsError(try read.takeIn(intake))
+            if place == 0 {
+                first = read.memoryHeld
+            }
         }
+        XCTAssertEqual(read.memoryHeld, first)
         XCTAssertLessThanOrEqual(read.memoryHeld, most)
     }
 
