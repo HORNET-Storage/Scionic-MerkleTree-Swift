@@ -99,6 +99,39 @@ final class ResponderTests: XCTestCase {
         XCTAssertEqual(try answer(Responder(store, have: false)), .refused(.notHeld))
     }
 
+    // A responder fills one frame again for every chunk it sends, from one
+    // request to the next. What it sends is the chunk that was asked for and
+    // nothing of a longer one before it, a frame that was kept is not changed by
+    // the next, and a request that is answered inside the answer to another is
+    // given a frame of its own.
+    func testAFrameThatIsFilledAgainHoldsTheChunkAskedForAlone() throws {
+        let store = MemoryStore()
+        let long = corpusBytes("frame-long", 4_000)
+        let short = corpusBytes("frame-short", 10)
+        for chunk in [long, short] {
+            try store.put(.chunk, Hash.of(chunk), chunk)
+        }
+        func ask(_ chunk: [UInt8]) -> [UInt8] {
+            Request.chunk(Hash.of(chunk)).encode()
+        }
+        let responder = Responder(store)
+        var sent: [[UInt8]] = []
+        for chunk in [long, short, long, short] {
+            try responder.answer(ask(chunk)) { sent.append($0) }
+        }
+        XCTAssertEqual(sent, [long, short, long, short].map { chunkFrame($0) })
+
+        var outer: [UInt8] = []
+        var inner: [UInt8] = []
+        try responder.answer(ask(long)) { frame in
+            try responder.answer(ask(short)) { inner = $0 }
+            // The answer inside left this frame as it was.
+            outer = frame
+        }
+        XCTAssertEqual(outer, chunkFrame(long))
+        XCTAssertEqual(inner, chunkFrame(short))
+    }
+
     func testAListReadWithItsTreeIsTheListReadAlone() throws {
         for count in [0, 1, 2, 3, 5, 8, 13, 100] {
             let items = try (0..<count).map { try ChunkRef.of(corpusBytes("chunk-\($0)", 16)) }

@@ -186,6 +186,8 @@ public final class Responder: Peer, @unchecked Sendable {
     /// of a long list needs its tree.
     private let files = Shared(Recent<OpenFile>())
     private let folders = Shared(Recent<OpenFolder>())
+    /// The frame that the last chunk was sent in, filled again for the next.
+    private let spareFrame = Shared<[UInt8]?>(nil)
 
     /// A responder for what `store` holds.
     ///
@@ -266,6 +268,27 @@ public final class Responder: Peer, @unchecked Sendable {
         return open
     }
 
+    /// Hands `body` a frame to send chunks in, and keeps it for the next answer
+    /// once `body` is done. Memory that is used again costs much less than fresh
+    /// memory for every chunk, which a system has to find and clear first. A
+    /// thread that finds the frame in use, by another thread or by an answer
+    /// that this one is still giving, is given a frame of its own.
+    private func withFrame(_ body: (inout [UInt8]) throws -> Void) rethrows {
+        let spare: [UInt8]? = spareFrame.with { kept in
+            defer { kept = nil }
+            return kept
+        }
+        var frame: [UInt8] = spare ?? []
+        defer {
+            spareFrame.with { kept in
+                if kept == nil {
+                    kept = frame
+                }
+            }
+        }
+        try body(&frame)
+    }
+
     /// Answers one request. Each frame of the answer is handed to `onFrame`. A
     /// request that is malformed is an error. A request for something the store
     /// does not hold is answered with a refusal.
@@ -280,9 +303,10 @@ public final class Responder: Peer, @unchecked Sendable {
         case let .file(file):
             try onFrame(try store.get(.fileList, file).map(fileListFrame) ?? notHeld)
         case let .chunk(chunk):
-            var frame: [UInt8] = []
-            let held = try lent(store, .chunk, chunk) { frame = chunkFrame($0) }
-            try onFrame(held ? frame : notHeld)
+            try withFrame { frame in
+                let held = try lent(store, .chunk, chunk) { refill(&frame, $0) }
+                try onFrame(held ? frame : notHeld)
+            }
         case let .folderBranch(folder, start, count):
             guard let open = try openFolder(folder) else {
                 return try onFrame(notHeld)
@@ -329,21 +353,16 @@ public final class Responder: Peer, @unchecked Sendable {
                 return try onFrame(outOfRange)
             }
             let end = min(list.count, start + min(UInt64(count), maxChunksPerAnswer))
-            // One frame is filled again for each chunk. Memory that is used
-            // again costs much less than fresh memory for every chunk, which a
-            // system has to find and clear first. A frame that the asker keeps
-            // is copied before it is filled again.
-            var frame: [UInt8] = []
-            for item in list.items[Int(start)..<Int(end)] {
-                let held = try lent(store, .chunk, item.hash) { bytes in
-                    frame.removeAll(keepingCapacity: true)
-                    frame.append(FrameTag.chunk)
-                    frame.append(contentsOf: bytes)
+            // A frame is lent to `onFrame` for the call only: the next chunk is
+            // filled into it, or into new memory where `onFrame` kept it.
+            try withFrame { frame in
+                for item in list.items[Int(start)..<Int(end)] {
+                    let held = try lent(store, .chunk, item.hash) { refill(&frame, $0) }
+                    guard held else {
+                        return try onFrame(notHeld)
+                    }
+                    try onFrame(frame)
                 }
-                guard held else {
-                    return try onFrame(notHeld)
-                }
-                try onFrame(frame)
             }
         case let .have(file):
             guard have, let list = try fileList(file) else {
@@ -365,6 +384,13 @@ public final class Responder: Peer, @unchecked Sendable {
             try onFrame(frame)
         }
     }
+}
+
+/// Fills `frame` with the frame of a chunk, from its start.
+private func refill(_ frame: inout [UInt8], _ chunk: UnsafeRawBufferPointer) {
+    frame.removeAll(keepingCapacity: true)
+    frame.append(FrameTag.chunk)
+    frame.append(contentsOf: chunk)
 }
 
 /// Asks for one frame. A refusal, no frame and more than one frame are errors.
@@ -579,7 +605,7 @@ public final class Remote {
                         throw tooMuch
                     }
                     let item = items[taken]
-                    try checkChunk(item, Array(bytes), "a chunk")
+                    try checkChunk(item, bytes, "a chunk")
                     let chunkEnd = chunkStart + UInt64(item.length)
                     let from = bytes.startIndex + Int(at - chunkStart)
                     let to = bytes.startIndex + Int(min(end, chunkEnd) - chunkStart)

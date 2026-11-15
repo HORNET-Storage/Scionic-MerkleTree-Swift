@@ -207,7 +207,7 @@ func loadFile(_ store: any Store, _ file: Target) throws -> FileList? {
 }
 
 /// Whether `bytes` are the chunk that `item` names.
-func checkChunk(_ item: ChunkRef, _ bytes: [UInt8], _ what: String) throws {
+func checkChunk(_ item: ChunkRef, _ bytes: ArraySlice<UInt8>, _ what: String) throws {
     guard bytes.count == Int(item.length) else {
         throw ScionicError.sizeMismatch(what: what, expected: UInt64(item.length), actual: UInt64(bytes.count))
     }
