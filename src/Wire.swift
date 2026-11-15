@@ -432,7 +432,8 @@ func writeFrame(_ sink: any ByteSink, tag: UInt8, body: [UInt8]) throws {
 
 /// What comes next on a stream of frames.
 enum Next {
-    case frame([UInt8])
+    /// A frame, which is in the buffer that was given to read it into.
+    case frame
     /// A length of zero. Where answers are sent, it ends one answer.
     case end
     /// The stream has ended, between two frames.
@@ -448,18 +449,24 @@ func writeEnd(_ sink: any ByteSink) throws {
     }
 }
 
-/// Reads what comes next on a stream. A frame longer than `limit` is refused
-/// before any of it is read, and a stream that ends inside a frame is an error.
-/// A frame's bytes are set aside as they come, a megabyte at a time.
-func readNext(_ source: any ByteSource, limit: Int) throws -> Next {
+/// Reads what comes next on a stream, a frame into `frame`, which is emptied
+/// first. One buffer serves frame after frame, so that memory is not taken
+/// afresh for each: memory that is used again costs much less than fresh
+/// memory, which a system has to find and clear first.
+///
+/// A frame longer than `limit` is refused before any of it is read, and a
+/// stream that ends inside a frame is an error. A frame's bytes are set aside
+/// as they come, a megabyte at a time, so that what a peer only says it will
+/// send costs nothing until it is sent.
+func readNext(_ source: any ByteSource, limit: Int, into frame: inout [UInt8]) throws -> Next {
     do {
-        return try readNextFrom(source, limit: limit)
+        return try readNextFrom(source, limit: limit, into: &frame)
     } catch {
         throw streamFailure(error, "read a frame")
     }
 }
 
-private func readNextFrom(_ source: any ByteSource, limit: Int) throws -> Next {
+private func readNextFrom(_ source: any ByteSource, limit: Int, into frame: inout [UInt8]) throws -> Next {
     let cutShort = invalid("a stream ends inside a frame")
     var header: (UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0)
     let ended = try withUnsafeMutableBytes(of: &header) { header -> Bool in
@@ -480,7 +487,7 @@ private func readNextFrom(_ source: any ByteSource, limit: Int) throws -> Next {
     guard length <= limit else {
         throw ScionicError.limitExceeded(what: "a frame", limit: UInt64(limit), requested: UInt64(length))
     }
-    var frame: [UInt8] = []
+    frame.removeAll(keepingCapacity: true)
     while frame.count < length {
         let held = frame.count
         let more = min(length - held, readStepBytes)
@@ -489,15 +496,16 @@ private func readNextFrom(_ source: any ByteSource, limit: Int) throws -> Next {
             try readExactly(source, UnsafeMutableRawBufferPointer(rebasing: raw[held...]), endsEarly: cutShort)
         }
     }
-    return .frame(frame)
+    return .frame
 }
 
 /// Reads one frame from a stream, or nil when the stream has ended. A frame
 /// longer than `limit` is refused before any of it is read, and a stream that
 /// ends inside a frame is an error.
 public func readFrame(_ source: any ByteSource, limit: Int) throws -> [UInt8]? {
-    switch try readNext(source, limit: limit) {
-    case let .frame(frame):
+    var frame: [UInt8] = []
+    switch try readNext(source, limit: limit, into: &frame) {
+    case .frame:
         return frame
     case .end:
         throw invalid("a frame is empty")

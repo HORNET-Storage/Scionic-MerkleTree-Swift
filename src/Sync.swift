@@ -679,8 +679,17 @@ public func importBundle(_ store: any Store, _ root: Root, from source: any Byte
         throw notABundle
     }
     let intake = try Intake(store: store, root: root)
-    while let frame = try readFrame(source, limit: intake.frameLimit) {
-        _ = try intake.accept(frame)
+    // One buffer serves every frame of the bundle.
+    var frame: [UInt8] = []
+    reading: while true {
+        switch try readNext(source, limit: intake.frameLimit, into: &frame) {
+        case .frame:
+            _ = try intake.accept(frame)
+        case .end:
+            throw invalid("a frame is empty")
+        case .closed:
+            break reading
+        }
     }
     return try intake.finish()
 }
@@ -746,11 +755,11 @@ public func serve(_ store: any Store, from source: any ByteSource, to sink: any 
     // for each other.
     let input = BufferedSource(source, capacity: serveBufferBytes)
     let responder = Responder(store)
+    var request: [UInt8] = []
     while true {
-        let request: [UInt8]
-        switch try readNext(input, limit: Scionic.maxRequestBytes) {
-        case let .frame(bytes):
-            request = bytes
+        switch try readNext(input, limit: Scionic.maxRequestBytes, into: &request) {
+        case .frame:
+            break
         case .end:
             throw invalid("a request is empty")
         case .closed:
@@ -772,6 +781,8 @@ public final class StreamPeer: Peer {
     private let output: any ByteSink
     private let ahead: Int
     private var broken = false
+    /// One buffer for every frame that is read, from answer to answer.
+    private var frame: [UInt8] = []
 
     /// A peer of a connection: `input` is what the other end sends, and
     /// `output` is what it reads. The output is flushed once requests are
@@ -848,8 +859,8 @@ public final class StreamPeer: Peer {
             try flush(output, "send a request")
             for place in answered..<sent {
                 reading: while true {
-                    switch try readNext(input, limit: requests[place].limit) {
-                    case let .frame(frame):
+                    switch try readNext(input, limit: requests[place].limit, into: &frame) {
+                    case .frame:
                         try onFrame(place, frame)
                     case .end:
                         break reading
