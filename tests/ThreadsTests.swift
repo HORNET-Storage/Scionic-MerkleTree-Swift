@@ -1,6 +1,6 @@
-// Several threads build and check what one thread builds and checks. And a
-// build that fails, or whose store falls over, ends: it is told as it happened,
-// nobody is left waiting, and no folder is left held open.
+// Several threads build, take in and check what one thread builds, takes in and
+// checks. And a build that fails, or whose store falls over, ends: it is told
+// as it happened, nobody is left waiting, and no folder is left held open.
 
 import XCTest
 @testable import ScionicMerkleTree
@@ -49,6 +49,82 @@ private final class SlowToFall: Store, @unchecked Sendable {
     func remove(_ kind: Stored, _ hash: Hash) throws {
         try inner.remove(kind, hash)
     }
+}
+
+/// A store that will not keep one chunk the first time it is handed it.
+private final class RefusingOnce: Store, @unchecked Sendable {
+    let inner = MemoryStore()
+    private let refused: Hash
+    private let asked = Shared(false)
+
+    init(_ refused: Hash) {
+        self.refused = refused
+    }
+
+    func put(_ kind: Stored, _ hash: Hash, _ bytes: UnsafeRawBufferPointer) throws {
+        if kind == .chunk && hash == refused && !asked.with({ asked in defer { asked = true }; return asked }) {
+            throw ScionicError.invariant("this store will not keep that chunk yet")
+        }
+        try inner.put(kind, hash, bytes)
+    }
+
+    func get(_ kind: Stored, _ hash: Hash) throws -> [UInt8]? {
+        try inner.get(kind, hash)
+    }
+
+    func remove(_ kind: Stored, _ hash: Hash) throws {
+        try inner.remove(kind, hash)
+    }
+}
+
+/// A store that will not keep one file's list.
+private final class RefusingList: Store, @unchecked Sendable {
+    let inner = MemoryStore()
+    private let refused: Hash
+
+    init(_ refused: Hash) {
+        self.refused = refused
+    }
+
+    func put(_ kind: Stored, _ hash: Hash, _ bytes: UnsafeRawBufferPointer) throws {
+        if kind == .fileList && hash == refused {
+            throw ScionicError.invariant("this store will not keep that list")
+        }
+        try inner.put(kind, hash, bytes)
+    }
+
+    func get(_ kind: Stored, _ hash: Hash) throws -> [UInt8]? {
+        try inner.get(kind, hash)
+    }
+
+    func remove(_ kind: Stored, _ hash: Hash) throws {
+        try inner.remove(kind, hash)
+    }
+}
+
+/// A tree of one file chunked by content, long enough that its chunks are taken
+/// in by several threads at once, and the frames of its bundle.
+private func longTree(_ seed: String) throws -> (store: MemoryStore, root: Root, frames: [[UInt8]]) {
+    let store = MemoryStore()
+    let builder = Builder(store: store, chunking: .fastCDCv1)
+    let root = try builder.finish(top: builder.file(bytes: corpusBytes(seed, 12 << 20)))
+    let bundle = MemorySink()
+    try exportBundle(store, root, to: bundle)
+    return (store, root, try framesOf(bundle.bytes[Scionic.bundleMagic.count...]))
+}
+
+/// A bundle that holds these frames.
+private func bundleOf(_ frames: [[UInt8]]) -> [UInt8] {
+    var bundle = Scionic.bundleMagic
+    for frame in frames {
+        bundle += u32be(UInt32(frame.count)) + frame
+    }
+    return bundle
+}
+
+/// Where the chunks' frames are among these frames.
+private func chunkPlaces(_ frames: [[UInt8]]) -> [Int] {
+    frames.indices.filter { frames[$0].first == FrameTag.chunk }
 }
 
 final class ThreadsTests: XCTestCase {
@@ -193,5 +269,115 @@ final class ThreadsTests: XCTestCase {
             assertFell(endsWithin(what) { [options] in try build(SlowToFall(), path: folder, options: options) }, what)
             XCTAssertNoThrow(try movable(folder), "\(what): the folder is still held after the build fell over")
         }
+    }
+
+    func testChunksTakenInBySeveralThreadsAreTakenInAsByOne() throws {
+        let (source, root, frames) = try longTree("threads-intake")
+        let places = chunkPlaces(frames)
+        XCTAssertGreaterThan(places.count, 3, "several chunks")
+        let imported = MemoryStore()
+        try importBundle(imported, root, from: BytesSource(bundleOf(frames)))
+        XCTAssertEqual(try contents(imported), try contents(source))
+        let fetched = MemoryStore()
+        try fetch(fetched, root, from: TestPeer(source))
+        XCTAssertEqual(try contents(fetched), try contents(source))
+
+        // A chunk that comes twice in a row is kept once.
+        var twice = frames
+        twice.insert(frames[places[1]], at: places[1] + 1)
+        let store = MemoryStore()
+        try importBundle(store, root, from: BytesSource(bundleOf(twice)))
+        XCTAssertEqual(try contents(store), try contents(source))
+    }
+
+    func testAChunkRefusedAmongOthersIsWhatIsToldAndNothingFalseIsKept() throws {
+        let (source, root, frames) = try longTree("threads-forged")
+        let places = chunkPlaces(frames)
+        // The third chunk's last byte is changed: no list names what it is now.
+        // The last chunk, taken in with it, holds nothing, which is refused too,
+        // and for another reason: the first one is what is told.
+        var forged = frames
+        forged[places[2]][forged[places[2]].count - 1] ^= 1
+        forged[places[places.count - 1]] = [FrameTag.chunk]
+        let store = MemoryStore()
+        assertFails(try importBundle(store, root, from: BytesSource(bundleOf(forged))), "notWanted")
+        // What was kept is the tree's, and so are the chunks that came before.
+        for kind in Stored.allCases {
+            for hash in store.hashes(kind) {
+                XCTAssertEqual(try store.get(kind, hash), try source.get(kind, hash), "\(kind) \(hash)")
+            }
+        }
+        for place in places[..<2] {
+            XCTAssertTrue(try store.has(.chunk, Hash.of(frames[place].dropFirst())))
+        }
+        // The tree is made whole from what is held.
+        try importBundle(store, root, from: BytesSource(bundleOf(frames)))
+        XCTAssertEqual(try contents(store), try contents(source))
+    }
+
+    func testABadChunkIsToldBeforeAListThatComesAfterIt() throws {
+        // A folder of two files, whose bundle holds the first file's chunks and
+        // then the second file's list, which this store will not keep. A chunk
+        // before that list is forged, and it is what is told: the chunks that
+        // are held are taken in before any frame that comes after them.
+        let source = MemoryStore()
+        let builder = Builder(store: source, chunking: .fastCDCv1)
+        let first = try builder.file(bytes: corpusBytes("threads-order-first", 6 << 20))
+        let second = try builder.file(bytes: corpusBytes("threads-order-second", 1 << 20))
+        let top = try builder.folder([Entry(name: "first", target: first), Entry(name: "second", target: second)])
+        let root = try builder.finish(top: top)
+        let bundle = MemorySink()
+        try exportBundle(source, root, to: bundle)
+        var frames = try framesOf(bundle.bytes[Scionic.bundleMagic.count...])
+        let list = try XCTUnwrap(frames.lastIndex { $0.first == FrameTag.fileList })
+        let forged = try XCTUnwrap(chunkPlaces(frames).first)
+        XCTAssertLessThan(forged, list)
+        frames[forged][frames[forged].count - 1] ^= 1
+        assertFails(try importBundle(RefusingList(second.hash), root, from: BytesSource(bundleOf(frames))), "notWanted")
+    }
+
+    func testAChunkThatAStoreCannotKeepIsWantedStill() throws {
+        let (source, root, frames) = try longTree("threads-refused-once")
+        let places = chunkPlaces(frames)
+        let refused = Hash.of(frames[places[1]].dropFirst())
+        func notYet<T>(_ body: @autoclosure () throws -> T, _ what: String) {
+            if case let .invariant(detail)? = assertFails(try body(), "invariant", what) {
+                XCTAssertEqual(detail, "this store will not keep that chunk yet", what)
+            }
+        }
+
+        // One frame at a time: the chunk is refused, and taken when it comes
+        // again.
+        var store = RefusingOnce(refused)
+        let intake = try Intake(store: store, root: root)
+        for frame in frames[..<places[1]] {
+            try intake.accept(frame)
+        }
+        notYet(try intake.accept(frames[places[1]]), "one at a time")
+        XCTAssertTrue(try intake.accept(frames[places[1]]).kept)
+        for frame in frames[(places[1] + 1)...] {
+            try intake.accept(frame)
+        }
+        _ = try intake.finish()
+        XCTAssertEqual(try contents(store.inner), try contents(source))
+
+        // Many at once, from a bundle and from a peer: the tree is made whole
+        // from what is held.
+        store = RefusingOnce(refused)
+        notYet(try importBundle(store, root, from: BytesSource(bundleOf(frames))), "from a bundle")
+        XCTAssertFalse(try store.inner.has(.chunk, refused))
+        try importBundle(store, root, from: BytesSource(bundleOf(frames)))
+        XCTAssertEqual(try contents(store.inner), try contents(source))
+        store = RefusingOnce(refused)
+        notYet(try fetch(store, root, from: TestPeer(source)), "from a peer")
+        try fetch(store, root, from: TestPeer(source))
+        XCTAssertEqual(try contents(store.inner), try contents(source))
+    }
+
+    func testAStoreThatFallsOverWhileChunksAreTakenInBringsTheFallToTheCaller() throws {
+        let (source, root, frames) = try longTree("threads-falling-intake")
+        let bundle = bundleOf(frames)
+        assertFell(endsWithin("an import") { try importBundle(FallingOnPut(), root, from: BytesSource(bundle)) }, "an import")
+        assertFell(endsWithin("a fetch") { try fetch(FallingOnPut(), root, from: TestPeer(source)) }, "a fetch")
     }
 }

@@ -654,26 +654,11 @@ public final class Intake {
             return Accepted(what: what, kept: true)
         case FrameTag.chunk:
             _ = try recorded()
-            guard !body.isEmpty, body.count <= Scionic.maxChunkBytes else {
-                throw invalid("a chunk does not hold 1 byte to 8 MiB")
+            let (hash, kept) = try withSlots { try takeChunk(store, $0, frame[...], expected) }
+            if let at = kept {
+                wantedChunks.remove(at)
             }
-            let hash = Hash.of(body)
-            let what = Arrived.chunk(hash)
-            try asAsked(what, "a chunk")
-            guard var slot = chunks[hash] else {
-                throw ScionicError.notWanted(what: "a chunk")
-            }
-            guard let at = slot.wantedAt else {
-                return Accepted(what: what, kept: false)
-            }
-            guard Int(slot.length) == body.count else {
-                throw ScionicError.sizeMismatch(what: "a chunk", expected: UInt64(slot.length), actual: UInt64(body.count))
-            }
-            try store.put(.chunk, hash, body)
-            slot.wantedAt = nil
-            chunks[hash] = slot
-            wantedChunks.remove(at)
-            return Accepted(what: what, kept: true)
+            return Accepted(what: .chunk(hash), kept: kept != nil)
         default:
             throw invalid("a frame that no tree is taken in by")
         }
@@ -687,6 +672,64 @@ public final class Intake {
         } catch {
             failed = true
             throw error
+        }
+    }
+
+    /// Lends the slots of the chunks to `body` behind a lock, so that several
+    /// threads may take chunks in at once.
+    private func withSlots<T>(_ body: (Shared<[Hash: ChunkSlot]>) throws -> T) rethrows -> T {
+        let slots = Shared<[Hash: ChunkSlot]>([:])
+        slots.with { swap(&$0, &chunks) }
+        defer { slots.with { swap(&$0, &chunks) } }
+        return try body(slots)
+    }
+
+    /// Takes chunk frames that come one after another, each as `accept` takes
+    /// it, or as `accept(_:expected:)` does where it comes with what it has to
+    /// be, with up to `workers` threads hashing and keeping them at once. The
+    /// error is that of the first frame, in their order, that is refused or
+    /// cannot be kept. A frame after it may have been kept, as it would have
+    /// been had it come first.
+    func acceptChunks(_ frames: ArraySlice<[UInt8]>, _ expected: [Arrived?], workers: Int) throws {
+        if failed {
+            throw ScionicError.intakeFailed
+        }
+        if frames.isEmpty {
+            return
+        }
+        _ = try recorded()
+        guard expected.count == frames.count else {
+            throw ScionicError.invariant("chunk frames came without what each has to be")
+        }
+        let store = self.store
+        let lent = Unchecked((frames: frames, expected: expected))
+        let dealer = Dealer(count: frames.count)
+        let taken = Shared([Result<(hash: Hash, kept: Place?), any Error>?](repeating: nil, count: frames.count))
+        withSlots { slots in
+            onWorkers(workerCount(max(workers, 1), work: frames.count)) { _ in
+                // Every frame is taken, whatever became of the one before it.
+                while let index = dealer.take() {
+                    let frame = lent.value.frames[lent.value.frames.startIndex + index]
+                    let result = Result { try takeChunk(store, slots, frame[...], lent.value.expected[index]) }
+                    taken.with { $0[index] = result }
+                }
+            }
+        }
+        var first: (any Error)?
+        for result in taken.with({ $0 }) {
+            switch result {
+            case let .success((_, kept))?:
+                if let at = kept {
+                    wantedChunks.remove(at)
+                }
+            case let .failure(error)?:
+                first = first ?? error
+            case nil:
+                first = first ?? ScionicError.invariant("a chunk frame was left out")
+            }
+        }
+        if let first {
+            throw first
         }
     }
 
@@ -832,6 +875,130 @@ public final class Intake {
             throw ScionicError.totalsMismatch(field: field, recorded: wanted, counted: found)
         }
         return Summary(record: record, folders: UInt64(folders.count), files: UInt64(files.count))
+    }
+}
+
+/// Takes one chunk frame in, on whichever thread: hashes it, finds the slot of
+/// the chunk in `slots`, and keeps the chunk, with the checks of
+/// `Intake.accept`, in their order. Gives the chunk's hash, and where it was
+/// wanted if it is kept now. A chunk that a slot names is claimed under the
+/// lock before it is kept, so that two frames of one chunk keep it once.
+private func takeChunk(
+    _ store: any Store,
+    _ slots: Shared<[Hash: ChunkSlot]>,
+    _ frame: ArraySlice<UInt8>,
+    _ expected: Arrived?
+) throws -> (hash: Hash, kept: Place?) {
+    guard frame.first == FrameTag.chunk else {
+        throw ScionicError.invariant("a frame taken in as a chunk is not a chunk")
+    }
+    let body = frame.dropFirst()
+    guard !body.isEmpty, body.count <= Scionic.maxChunkBytes else {
+        throw invalid("a chunk does not hold 1 byte to 8 MiB")
+    }
+    let hash = Hash.of(body)
+    if let expected, expected != .chunk(hash) {
+        throw ScionicError.notWanted(what: "a chunk")
+    }
+    let claimed: Place? = try slots.with { slots in
+        guard var slot = slots[hash] else {
+            throw ScionicError.notWanted(what: "a chunk")
+        }
+        guard let at = slot.wantedAt else {
+            return nil
+        }
+        guard Int(slot.length) == body.count else {
+            throw ScionicError.sizeMismatch(what: "a chunk", expected: UInt64(slot.length), actual: UInt64(body.count))
+        }
+        slot.wantedAt = nil
+        slots[hash] = slot
+        return at
+    }
+    guard let at = claimed else {
+        return (hash, nil)
+    }
+    do {
+        try store.put(.chunk, hash, body)
+    } catch {
+        // Not kept, so it is wanted still.
+        slots.with { $0[hash]?.wantedAt = at }
+        throw error
+    }
+    return (hash, at)
+}
+
+/// The most bytes of chunk frames that wait to be taken in together.
+private let chunkFramesBytes = 64 << 20
+
+/// The most chunk frames that wait to be taken in together, however short.
+private let chunkFramesCount = 1024
+
+/// The least bytes of chunk frames that are worth a thread of their own.
+private let chunkBytesByEach = 1 << 20
+
+/// Chunk frames that come one after another, held to be taken in together, so
+/// that several threads hash and keep them at once. The buffers serve one batch
+/// after another: memory that is used again costs much less than fresh memory,
+/// which a system has to find and clear first.
+final class ChunkFrames {
+    private var buffers: [[UInt8]] = []
+    private var expected: [Arrived?] = []
+    private var held = 0
+    private var bytes = 0
+    private let cores = processorCount()
+
+    /// Lends `body` the buffer that the next frame is read into. The frame is
+    /// held only once `hold` is called.
+    func withNextBuffer<T>(_ body: (inout [UInt8]) throws -> T) rethrows -> T {
+        if held == buffers.count {
+            buffers.append([])
+        }
+        return try body(&buffers[held])
+    }
+
+    /// Whether the frame in the next buffer is a chunk's.
+    var nextIsChunk: Bool {
+        held < buffers.count && buffers[held].first == FrameTag.chunk
+    }
+
+    /// Holds the frame in the next buffer. It has to be `expected`, when that
+    /// is given.
+    func hold(_ expected: Arrived?) {
+        if held == buffers.count {
+            buffers.append([])
+        }
+        bytes += buffers[held].count
+        self.expected.append(expected)
+        held += 1
+    }
+
+    /// Holds a copy of `frame`, which is lent for the call only.
+    func holdCopy(_ frame: [UInt8], _ expected: Arrived?) {
+        withNextBuffer { buffer in
+            buffer.removeAll(keepingCapacity: true)
+            buffer.append(contentsOf: frame)
+        }
+        hold(expected)
+    }
+
+    /// Whether enough frames are held to take them in now.
+    var full: Bool {
+        bytes >= chunkFramesBytes || held >= chunkFramesCount
+    }
+
+    /// Takes the frames that are held into `intake`, and holds none after. With
+    /// none held, the intake is not asked anything: an intake that failed has
+    /// given its failure already.
+    func takeIn(_ intake: Intake) throws {
+        if held == 0 {
+            return
+        }
+        defer {
+            held = 0
+            bytes = 0
+            expected.removeAll(keepingCapacity: true)
+        }
+        try intake.acceptChunks(buffers[..<held], expected, workers: min(cores, bytes / chunkBytesByEach + 1))
     }
 }
 

@@ -430,6 +430,9 @@ private func askOne(_ peer: any Peer, _ request: Request, limit: Int) throws -> 
 @discardableResult
 public func fetch(_ store: any Store, _ root: Root, from peer: any Peer) throws -> Summary {
     let intake = try Intake(store: store, root: root)
+    // Chunks that come one after another are held, and taken in together by
+    // several threads.
+    let frames = ChunkFrames()
     while true {
         let requests = intake.requests(limit: requestsPerRound)
         if requests.isEmpty {
@@ -442,24 +445,40 @@ public func fetch(_ store: any Store, _ root: Root, from peer: any Peer) throws 
         let asks = requests.map { Asked(request: $0.encode(), limit: intake.answerLimit($0)) }
         var taken = [Int](repeating: 0, count: requests.count)
         var refused = [Bool](repeating: false, count: requests.count)
-        try peer.askAll(asks) { place, frame in
-            guard requests.indices.contains(place) else {
-                throw peerError("answered a request that was not sent")
+        let asked = Result<Void, any Error> {
+            try peer.askAll(asks) { place, frame in
+                guard requests.indices.contains(place) else {
+                    throw peerError("answered a request that was not sent")
+                }
+                if refused[place] {
+                    throw peerError("sent more after it refused")
+                }
+                if frame.first == FrameTag.refused {
+                    _ = try Frame(decoding: frame)
+                    refused[place] = true
+                    return
+                }
+                guard taken[place] < expected[place].count else {
+                    throw tooMuch
+                }
+                let wanted = expected[place][taken[place]]
+                if case .chunk = wanted, frame.first == FrameTag.chunk {
+                    frames.holdCopy(frame, wanted)
+                    if frames.full {
+                        try frames.takeIn(intake)
+                    }
+                } else {
+                    // What came before is taken in first.
+                    try frames.takeIn(intake)
+                    _ = try intake.accept(frame, expected: wanted)
+                }
+                taken[place] += 1
             }
-            if refused[place] {
-                throw peerError("sent more after it refused")
-            }
-            if frame.first == FrameTag.refused {
-                _ = try Frame(decoding: frame)
-                refused[place] = true
-                return
-            }
-            guard taken[place] < expected[place].count else {
-                throw tooMuch
-            }
-            _ = try intake.accept(frame, expected: expected[place][taken[place]])
-            taken[place] += 1
         }
+        // What came before a failure is taken in first, and its own failure is
+        // the one given.
+        try frames.takeIn(intake)
+        try asked.get()
         if taken.contains(0) {
             throw peerError("does not hold what the tree needs")
         }
@@ -712,18 +731,42 @@ public func importBundle(_ store: any Store, _ root: Root, from source: any Byte
         throw notABundle
     }
     let intake = try Intake(store: store, root: root)
-    // One buffer serves every frame of the bundle.
+    // Chunks that come one after another are held, and taken in together by
+    // several threads, once the record is in. Each frame is read into a buffer
+    // of theirs, and one more buffer serves every other frame of the bundle.
+    let frames = ChunkFrames()
     var frame: [UInt8] = []
-    reading: while true {
-        switch try readNext(source, limit: intake.frameLimit, into: &frame) {
-        case .frame:
-            _ = try intake.accept(frame)
-        case .end:
-            throw invalid("a frame is empty")
-        case .closed:
-            break reading
+    // What the intake takes changes only when it takes a frame that is not a
+    // chunk's, and those are taken here.
+    var limit = intake.frameLimit
+    var recorded = intake.record != nil
+    let read = Result<Void, any Error> {
+        reading: while true {
+            switch try frames.withNextBuffer({ try readNext(source, limit: limit, into: &$0) }) {
+            case .frame where recorded && frames.nextIsChunk:
+                frames.hold(nil)
+                if frames.full {
+                    try frames.takeIn(intake)
+                }
+            case .frame:
+                // The frame is moved out of the buffers first, and what came
+                // before it is taken in before it.
+                frames.withNextBuffer { swap(&frame, &$0) }
+                try frames.takeIn(intake)
+                _ = try intake.accept(frame)
+                limit = intake.frameLimit
+                recorded = intake.record != nil
+            case .end:
+                throw invalid("a frame is empty")
+            case .closed:
+                break reading
+            }
         }
     }
+    // What came before a failure is taken in first, and its own failure is the
+    // one given.
+    try frames.takeIn(intake)
+    try read.get()
     return try intake.finish()
 }
 
